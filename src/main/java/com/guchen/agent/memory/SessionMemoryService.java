@@ -61,7 +61,7 @@ public class SessionMemoryService {
             List<Map<String, String>> list = mapper.readValue(json,
                     new TypeReference<List<Map<String, String>>>() {});
             for (Map<String, String> m : list) {
-                messages.add(new Message(m.get("role"), m.get("content"), null, null));
+                messages.add(new Message(m.get("role"), m.get("content"), null, null, null));
             }
         } catch (Exception e) {
             log.warn("解析会话历史失败 session={}", sessionId, e);

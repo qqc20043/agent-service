@@ -1,5 +1,6 @@
 package com.guchen.agent.agent;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.guchen.agent.client.FeignAuthConfig;
 import com.guchen.agent.llm.LlmClient;
@@ -43,6 +44,7 @@ public class AgentOrchestrator {
     private final HybridRetriever retriever;
     private final SessionMemoryService memory;
     private final AgentTraceService trace;
+    private final ObjectMapper mapper;
 
     @Value("${agent.max-iterations:6}")
     private int maxIterations;
@@ -110,7 +112,8 @@ public class AgentOrchestrator {
             // ---------- 3. ReAct 循环（受控自主） ----------
             String finalAnswer = null;
             for (int i = 0; i < maxIterations; i++) {
-                ChatResult result = llm.chat(messages, toolsSchema);
+                // 走流式分片重组而非非流式：网关非流式会丢 tool_calls（见 LlmClient#chatViaStream）
+                ChatResult result = llm.chatViaStream(messages, toolsSchema);
                 totalPromptTokens += result.usage().promptTokens();
                 totalCompletionTokens += result.usage().completionTokens();
 
@@ -126,7 +129,12 @@ public class AgentOrchestrator {
                     break;
                 }
 
-                messages.add(Message.assistant(result.content()));
+                // 协议要求：回传 tool 结果时，前置 assistant 消息必须原样携带 tool_calls，
+                // 否则第二轮请求会被网关/上游以 400 拒绝（骨架首轮真实工具链暴露的 bug）
+                messages.add(result.hasToolCalls()
+                        ? Message.assistantWithToolCalls(result.content(),
+                                Message.toolCallsToArray(mapper, result.toolCalls()))
+                        : Message.assistant(result.content()));
 
                 for (ToolCall call : result.toolCalls()) {
                     toolCallCount++;

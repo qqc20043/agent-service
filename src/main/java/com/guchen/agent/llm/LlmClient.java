@@ -14,7 +14,9 @@ import reactor.util.retry.Retry;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 /**
@@ -177,6 +179,109 @@ public class LlmClient {
         }
     }
 
+    // ==================== 流式分片重组（绕网关 FC 缺陷） ====================
+
+    /**
+     * 流式调用 + 完整重组，返回与非流式 chat() 相同的 ChatResult。
+     *
+     * 背景（2026-10-04 网关审计）：自建网关在【非流式】模式下会丢弃 tool_calls
+     * （只回 finish_reason=tool_calls，message 里数组为空），但【流式】模式下
+     * delta.tool_calls 分片按标准 OpenAI 协议完整透传（首片带 id+name，
+     * 后续片按 index 追加 arguments）。因此 ReAct 循环改走本方法：
+     * 内部消费 SSE 流并重组出完整的工具调用，对外语义与 chat() 一致。
+     */
+    public ChatResult chatViaStream(List<Message> messages, ArrayNode tools) {
+        ObjectNode body = buildBody(messages, tools, true);
+
+        AtomicInteger promptTokens = new AtomicInteger();
+        AtomicInteger completionTokens = new AtomicInteger();
+        AtomicReference<String> finishReason = new AtomicReference<>("stop");
+        StringBuilder content = new StringBuilder();
+        Map<Integer, ToolCallAssembler> assemblers = new java.util.HashMap<>();
+
+        webClient.post()
+                .uri("/v1/chat/completions")
+                .accept(MediaType.TEXT_EVENT_STREAM)
+                .bodyValue(body)
+                .retrieve()
+                .bodyToFlux(String.class)
+                .timeout(timeout)
+                .retryWhen(Retry.backoff(maxRetries, Duration.ofMillis(retryBackoffMs))
+                        .filter(this::isRetryable))
+                .doOnNext(chunk -> assembleStreamChunk(
+                        chunk, content, assemblers, promptTokens, completionTokens, finishReason))
+                .blockLast();
+
+        List<ToolCall> toolCalls = assemblers.entrySet().stream()
+                .sorted(Map.Entry.comparingByKey())
+                .map(e -> e.getValue().build())
+                .toList();
+
+        log.debug("流式重组完成：content {} 字，tool_calls {} 个", content.length(), toolCalls.size());
+        return new ChatResult(content.toString(), toolCalls,
+                new TokenUsage(promptTokens.get(), completionTokens.get()), finishReason.get());
+    }
+
+    /** 解析单个 SSE 分片并就地重组（内容拼接 / 工具分片聚合 / 用量与结束原因）。 */
+    private void assembleStreamChunk(String chunk, StringBuilder content,
+                                     Map<Integer, ToolCallAssembler> assemblers,
+                                     AtomicInteger promptTokens, AtomicInteger completionTokens,
+                                     AtomicReference<String> finishReason) {
+        for (String raw : chunk.split("\n")) {
+            String line = raw.trim();
+            if (line.isEmpty()) continue;
+            if (line.startsWith("data:")) line = line.substring(5).trim();
+            if (line.isEmpty() || "[DONE]".equals(line)) continue;
+
+            try {
+                JsonNode node = mapper.readTree(line);
+
+                JsonNode usage = node.path("usage");
+                if (!usage.isMissingNode() && !usage.isNull()) {
+                    promptTokens.set(usage.path("prompt_tokens").asInt(0));
+                    completionTokens.set(usage.path("completion_tokens").asInt(0));
+                }
+
+                JsonNode choice = node.path("choices").path(0);
+                String fr = choice.path("finish_reason").asText("");
+                if (!fr.isEmpty()) finishReason.set(fr);
+
+                JsonNode delta = choice.path("delta");
+                String piece = delta.path("content").asText("");
+                if (!piece.isEmpty()) content.append(piece);
+
+                JsonNode tcs = delta.path("tool_calls");
+                if (tcs.isArray()) {
+                    for (JsonNode tc : tcs) {
+                        int index = tc.path("index").asInt(0);
+                        assemblers.computeIfAbsent(index, k -> new ToolCallAssembler()).merge(tc);
+                    }
+                }
+            } catch (Exception e) {
+                log.trace("跳过无法解析的 SSE 分片: {}", line);
+            }
+        }
+    }
+
+    /** 单个工具调用的分片聚合器：首片携带 id/name，后续片按 index 追加 arguments。 */
+    private static class ToolCallAssembler {
+        private String id;
+        private String name;
+        private final StringBuilder arguments = new StringBuilder();
+
+        void merge(JsonNode tc) {
+            if (id == null && !tc.path("id").asText("").isEmpty()) id = tc.path("id").asText();
+            String n = tc.path("function").path("name").asText("");
+            if (!n.isEmpty()) name = n;
+            arguments.append(tc.path("function").path("arguments").asText(""));
+        }
+
+        ToolCall build() {
+            return new ToolCall(id != null ? id : "call_" + System.nanoTime(),
+                    name != null ? name : "unknown", arguments.toString());
+        }
+    }
+
     // ==================== 内部工具 ====================
 
     private ObjectNode buildBody(List<Message> messages, ArrayNode tools, boolean stream) {
@@ -192,6 +297,7 @@ public class LlmClient {
             node.put("content", m.content());
             if (m.toolCallId() != null) node.put("tool_call_id", m.toolCallId());
             if (m.name() != null) node.put("name", m.name());
+            if (m.toolCalls() != null && !m.toolCalls().isEmpty()) node.set("tool_calls", m.toolCalls());
         }
 
         if (tools != null && !tools.isEmpty()) {
@@ -266,12 +372,31 @@ public class LlmClient {
 
     // ==================== 数据载体 ====================
 
-    public record Message(String role, String content, String toolCallId, String name) {
-        public static Message system(String c) { return new Message("system", c, null, null); }
-        public static Message user(String c) { return new Message("user", c, null, null); }
-        public static Message assistant(String c) { return new Message("assistant", c, null, null); }
+    public record Message(String role, String content, String toolCallId, String name,
+                          ArrayNode toolCalls) {
+        public static Message system(String c) { return new Message("system", c, null, null, null); }
+        public static Message user(String c) { return new Message("user", c, null, null, null); }
+        public static Message assistant(String c) { return new Message("assistant", c, null, null, null); }
+        /** 带工具调用的 assistant 消息：回传 tool 结果时协议要求原样携带 tool_calls */
+        public static Message assistantWithToolCalls(String c, ArrayNode toolCalls) {
+            return new Message("assistant", c, null, null, toolCalls);
+        }
         public static Message tool(String toolCallId, String name, String content) {
-            return new Message("tool", content, toolCallId, name);
+            return new Message("tool", content, toolCallId, name, null);
+        }
+
+        /** 把重组出的工具调用列表序列化为请求体里的 tool_calls 数组 */
+        public static ArrayNode toolCallsToArray(ObjectMapper mapper, List<ToolCall> calls) {
+            ArrayNode arr = mapper.createArrayNode();
+            for (ToolCall c : calls) {
+                ObjectNode one = arr.addObject();
+                one.put("id", c.id());
+                one.put("type", "function");
+                one.putObject("function")
+                        .put("name", c.name())
+                        .put("arguments", c.arguments());
+            }
+            return arr;
         }
     }
 
