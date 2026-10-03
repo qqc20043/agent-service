@@ -1,0 +1,262 @@
+package com.guchen.agent.llm;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Flux;
+import reactor.util.retry.Retry;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+
+/**
+ * 手写 LLM 客户端（OpenAI 兼容协议）。
+ *
+ * 为什么不用 Spring AI：
+ *  1) spring-ai-bom 1.0.0 GA 要求 Spring Boot 3.4+，与本项目 Boot 3.2.4 冲突；
+ *  2) 手写才能讲清楚 SSE 分块解析、退避重试、token 计量 —— 这正是面试要问的。
+ *
+ * 覆盖能力：
+ *  - 同步对话 / 流式对话（SSE 逐块解析）
+ *  - 指数退避重试（仅对 5xx、超时、连接错误重试；4xx 不重试）
+ *  - Function Calling（tools 参数 + tool_calls 解析）
+ *  - token 用量统计（供成本计量落库）
+ */
+@Slf4j
+@Component
+public class LlmClient {
+
+    private final WebClient webClient;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    @Value("${llm.chat-model}")
+    private String chatModel;
+
+    @Value("${llm.max-retries:3}")
+    private int maxRetries;
+
+    @Value("${llm.retry-backoff-ms:800}")
+    private long retryBackoffMs;
+
+    public LlmClient(@Value("${llm.base-url}") String baseUrl,
+                     @Value("${llm.api-key}") String apiKey,
+                     @Value("${llm.timeout-seconds:60}") long timeoutSeconds) {
+        this.webClient = WebClient.builder()
+                .baseUrl(baseUrl)
+                .defaultHeader("Authorization", "Bearer " + apiKey)
+                .defaultHeader("Content-Type", MediaType.APPLICATION_JSON_VALUE)
+                // 大模型首包可能很慢，读超时要给足
+                .codecs(c -> c.defaultCodecs().maxInMemorySize(16 * 1024 * 1024))
+                .build();
+        this.timeout = Duration.ofSeconds(timeoutSeconds);
+    }
+
+    private final Duration timeout;
+
+    // ==================== 同步对话 ====================
+
+    /**
+     * 非流式对话，返回完整文本。
+     *
+     * @param messages OpenAI 格式消息列表
+     * @param tools    工具定义（可为 null）
+     */
+    public ChatResult chat(List<Message> messages, ArrayNode tools) {
+        ObjectNode body = buildBody(messages, tools, false);
+
+        JsonNode resp = webClient.post()
+                .uri("/v1/chat/completions")
+                .bodyValue(body)
+                .retrieve()
+                .bodyToMono(JsonNode.class)
+                .timeout(timeout)
+                .retryWhen(Retry.backoff(maxRetries, Duration.ofMillis(retryBackoffMs))
+                        .filter(this::isRetryable)
+                        .doBeforeRetry(sig -> log.warn("LLM 调用失败，第 {} 次重试：{}",
+                                sig.totalRetries() + 1, sig.failure().getMessage())))
+                .block();
+
+        return parseResult(resp);
+    }
+
+    // ==================== 流式对话（SSE） ====================
+
+    /**
+     * 流式对话。每个 token 片段通过 onDelta 回调吐出。
+     *
+     * SSE 数据格式（OpenAI 兼容）：
+     *   data: {"choices":[{"delta":{"content":"你"}}]}
+     *   data: {"choices":[{"delta":{"content":"好"}}]}
+     *   data: [DONE]
+     *
+     * @param onDelta   每个增量片段的回调
+     * @param onComplete 流结束回调，带累计 token 用量
+     */
+    public void chatStream(List<Message> messages,
+                           ArrayNode tools,
+                           Consumer<String> onDelta,
+                           Consumer<TokenUsage> onComplete,
+                           Consumer<Throwable> onError) {
+
+        ObjectNode body = buildBody(messages, tools, true);
+
+        AtomicInteger promptTokens = new AtomicInteger();
+        AtomicInteger completionTokens = new AtomicInteger();
+        StringBuilder full = new StringBuilder();
+
+        Flux<String> lines = webClient.post()
+                .uri("/v1/chat/completions")
+                .accept(MediaType.TEXT_EVENT_STREAM)
+                .bodyValue(body)
+                .retrieve()
+                .bodyToFlux(String.class);
+
+        lines.timeout(timeout)
+                .retryWhen(Retry.backoff(maxRetries, Duration.ofMillis(retryBackoffMs))
+                        .filter(this::isRetryable))
+                .subscribe(
+                        chunk -> handleSseChunk(chunk, onDelta, full, promptTokens, completionTokens),
+                        onError,
+                        () -> {
+                            log.debug("LLM 流式结束，累计输出 {} 字", full.length());
+                            onComplete.accept(new TokenUsage(
+                                    promptTokens.get(), completionTokens.get()));
+                        }
+                );
+    }
+
+    /** 解析单个 SSE 分片。兼容带/不带 "data: " 前缀两种返回。 */
+    private void handleSseChunk(String chunk, Consumer<String> onDelta,
+                                StringBuilder full,
+                                AtomicInteger promptTokens,
+                                AtomicInteger completionTokens) {
+        for (String raw : chunk.split("\n")) {
+            String line = raw.trim();
+            if (line.isEmpty()) continue;
+            if (line.startsWith("data:")) line = line.substring(5).trim();
+            if ("[DONE]".equals(line)) continue;
+
+            try {
+                JsonNode node = mapper.readTree(line);
+
+                // 用量信息可能在最后一块
+                JsonNode usage = node.path("usage");
+                if (!usage.isMissingNode() && !usage.isNull()) {
+                    promptTokens.set(usage.path("prompt_tokens").asInt(0));
+                    completionTokens.set(usage.path("completion_tokens").asInt(0));
+                }
+
+                JsonNode delta = node.path("choices").path(0).path("delta");
+                // 兼容 reasoning_content（DeepSeek-R1 类模型）与 content
+                String piece = delta.path("content").asText("");
+                if (piece.isEmpty()) piece = delta.path("reasoning_content").asText("");
+                if (!piece.isEmpty()) {
+                    full.append(piece);
+                    onDelta.accept(piece);
+                }
+
+                // 流式下 tool_calls 是分片拼装的，这里只做日志，完整解析在非流式路径
+                if (delta.has("tool_calls")) {
+                    log.debug("检测到流式 tool_calls 分片");
+                }
+            } catch (Exception e) {
+                log.trace("跳过无法解析的 SSE 分片: {}", line);
+            }
+        }
+    }
+
+    // ==================== 内部工具 ====================
+
+    private ObjectNode buildBody(List<Message> messages, ArrayNode tools, boolean stream) {
+        ObjectNode body = mapper.createObjectNode();
+        body.put("model", chatModel);
+        body.put("stream", stream);
+        body.put("temperature", 0.3);   // Agent 场景要稳定，不宜高
+
+        ArrayNode arr = body.putArray("messages");
+        for (Message m : messages) {
+            ObjectNode node = arr.addObject();
+            node.put("role", m.role());
+            node.put("content", m.content());
+            if (m.toolCallId() != null) node.put("tool_call_id", m.toolCallId());
+            if (m.name() != null) node.put("name", m.name());
+        }
+
+        if (tools != null && !tools.isEmpty()) {
+            body.set("tools", tools);
+            body.put("tool_choice", "auto");
+        }
+        return body;
+    }
+
+    private ChatResult parseResult(JsonNode resp) {
+        if (resp == null) throw new LlmException("LLM 返回为空");
+
+        JsonNode choice = resp.path("choices").path(0);
+        JsonNode msg = choice.path("message");
+        String content = msg.path("content").asText("");
+
+        JsonNode usage = resp.path("usage");
+        TokenUsage tokenUsage = new TokenUsage(
+                usage.path("prompt_tokens").asInt(0),
+                usage.path("completion_tokens").asInt(0));
+
+        // 解析 tool_calls
+        List<ToolCall> toolCalls = new java.util.ArrayList<>();
+        JsonNode tc = msg.path("tool_calls");
+        if (tc.isArray()) {
+            for (JsonNode one : tc) {
+                toolCalls.add(new ToolCall(
+                        one.path("id").asText(),
+                        one.path("function").path("name").asText(),
+                        one.path("function").path("arguments").asText("{}")));
+            }
+        }
+
+        return new ChatResult(content, toolCalls, tokenUsage,
+                choice.path("finish_reason").asText("stop"));
+    }
+
+    /** 只对可恢复错误重试：超时、连接异常、5xx。4xx（鉴权/参数错）重试无意义。 */
+    private boolean isRetryable(Throwable t) {
+        if (t instanceof java.util.concurrent.TimeoutException) return true;
+        if (t instanceof org.springframework.web.reactive.function.client.WebClientResponseException w) {
+            return w.getStatusCode().is5xxServerError() || w.getStatusCode().value() == 429;
+        }
+        return true; // 连接层异常
+    }
+
+    // ==================== 数据载体 ====================
+
+    public record Message(String role, String content, String toolCallId, String name) {
+        public static Message system(String c) { return new Message("system", c, null, null); }
+        public static Message user(String c) { return new Message("user", c, null, null); }
+        public static Message assistant(String c) { return new Message("assistant", c, null, null); }
+        public static Message tool(String toolCallId, String name, String content) {
+            return new Message("tool", content, toolCallId, name);
+        }
+    }
+
+    public record ToolCall(String id, String name, String arguments) {}
+
+    public record TokenUsage(int promptTokens, int completionTokens) {
+        public int total() { return promptTokens + completionTokens; }
+    }
+
+    public record ChatResult(String content, List<ToolCall> toolCalls,
+                             TokenUsage usage, String finishReason) {
+        public boolean hasToolCalls() { return toolCalls != null && !toolCalls.isEmpty(); }
+    }
+
+    public static class LlmException extends RuntimeException {
+        public LlmException(String msg) { super(msg); }
+    }
+}

@@ -1,0 +1,127 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: agent-service
+  profiles:
+    active: dev
+  cloud:
+    nacos:
+      # ---------- 注册中心 ----------
+      discovery:
+        server-addr: ${NACOS_ADDR:127.0.0.1:8848}
+        namespace: public
+        group: DEFAULT_GROUP
+      # ---------- 配置中心 ----------
+      config:
+        server-addr: ${NACOS_ADDR:127.0.0.1:8848}
+        file-extension: yaml
+        group: DEFAULT_GROUP
+        # 支持不重启刷新：改 Nacos 里的配置，@RefreshScope 的 Bean 立刻生效
+        refresh-enabled: true
+
+  # ---------- Agent 自己的库（与老项目 db_tear 分开） ----------
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/db_agent?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+    username: root
+    password: root
+
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+      database: 2          # 老项目用 1，Agent 用 2，互不污染
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 2
+
+  rabbitmq:
+    host: 127.0.0.1
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    listener:
+      simple:
+        acknowledge-mode: manual      # 手动 ack，配合幂等消费
+        prefetch: 10
+        retry:
+          enabled: true
+          max-attempts: 3
+          initial-interval: 1000ms
+          multiplier: 2.0
+
+mybatis-plus:
+  type-aliases-package: com.guchen.agent.entity
+  global-config:
+    db-config:
+      id-type: auto
+      logic-delete-field: isvalid
+      logic-delete-value: "N"
+      logic-not-delete-value: "Y"
+
+# ---------- LLM 配置（可被 Nacos 覆盖，实现模型热切换） ----------
+llm:
+  base-url: ${LLM_BASE_URL:https://api.deepseek.com}
+  api-key: ${LLM_API_KEY:sk-REPLACE_ME}
+  chat-model: deepseek-chat
+  embedding-model: bge-m3
+  timeout-seconds: 60
+  max-retries: 3
+  retry-backoff-ms: 800
+
+# ---------- Agent 运行参数（Nacos 动态改，不重启） ----------
+agent:
+  max-iterations: 6
+  max-tool-calls-per-turn: 5
+  tool-timeout-ms: 3000
+  memory:
+    max-turns: 10
+    ttl-minutes: 120
+
+# ---------- 向量库 ----------
+vector:
+  qdrant:
+    host: 127.0.0.1
+    port: 6334
+    collection: ms_tea_knowledge
+    enabled: true
+  milvus:
+    host: 127.0.0.1
+    port: 19530
+    collection: ms_tea_knowledge
+    enabled: false        # 做对比实验时才置 true
+
+# ---------- 被调用的老项目 ----------
+services:
+  tear-spring:
+    # 走 Nacos 服务发现，不写死 IP
+    service-name: tearSpring
+
+# ---------- MCP / A2A ----------
+mcp:
+  enabled: true
+  server-name: mansicha-tea-tools
+  endpoint-path: /mcp
+a2a:
+  enabled: true
+  agent-card-path: /.well-known/agent.json
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    com.guchen.agent: DEBUG
+    org.springframework.web: INFO

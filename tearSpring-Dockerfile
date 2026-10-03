@@ -1,0 +1,37 @@
+# ============================================================
+# tearSpring（老项目）生产镜像
+# 注意：老项目是 Spring Boot 2.6.13 + JDK 8，不要升级！
+#       升 Boot 3 会牵动 javax→jakarta 全量改造，风险远大于收益。
+# 放置位置：复制到 2026027318-02素材与源码/源码/tearSpring/Dockerfile
+# ============================================================
+FROM maven:3.9.6-eclipse-temurin-8 AS builder
+WORKDIR /build
+
+COPY pom.xml .
+RUN mvn -B dependency:go-offline
+
+COPY src ./src
+RUN mvn -B clean package -DskipTests
+
+# ============================================================
+FROM eclipse-temurin:8-jre-jammy AS runtime
+
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+WORKDIR /app
+COPY --from=builder /build/target/*.jar app.jar
+
+RUN chown -R appuser:appuser /app
+USER appuser
+
+ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=70 -XX:+UseG1GC -Dfile.encoding=UTF-8 -Djava.security.egd=file:/dev/./urandom"
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD wget -qO- http://localhost:8080/actuator/health || exit 1
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar app.jar"]

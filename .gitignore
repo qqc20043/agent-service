@@ -1,0 +1,34 @@
+# ============================================================
+# 密钥与构建产物 —— 绝不提交
+# ============================================================
+
+# 环境变量（含 LLM API Key、数据库密码）
+.env
+.env.*
+!.env.example
+
+# SSL 证书
+nginx/certs/
+*.pem
+*.key
+
+# 日志
+nginx/logs/
+*.log
+
+# 备份
+backups/
+
+# Java 构建产物
+target/
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# 系统
+.DS_Store
+Thumbs.db

@@ -1,0 +1,216 @@
+# ============================================================
+# 演示版编排 —— 开发调试 / 面试展示专用
+#
+# 与 docker-compose.prod.yml 的区别：
+#   - 不要 Nginx，不用 HTTPS，不用证书
+#   - 直接暴露 8080 / 8081 端口，前端用 IP 直连
+#   - 资源限制放宽，方便调试（可挂远程 debug）
+#
+# 使用：docker compose -f docker-compose.demo.yml up -d
+# ============================================================
+name: mansicha-demo
+
+services:
+  # ============ Agent 服务 ============
+  agent-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mansicha/agent-service:demo
+    container_name: ms-agent-service
+    ports:
+      - "8081:8081"
+      # 远程调试端口（IDEA 用 Remote JVM Debug 连接 5005）
+      - "5005:5005"
+    environment:
+      - NACOS_ADDR=nacos:8848
+      - LLM_API_KEY=${LLM_API_KEY:-sk-REPLACE_ME}
+      - LLM_BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com}
+      - SPRING_DATASOURCE_URL=jdbc:mysql://mysql:3306/db_agent?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+      - SPRING_DATASOURCE_USERNAME=root
+      - SPRING_DATASOURCE_PASSWORD=${MYSQL_PASSWORD:-root}
+      - SPRING_DATA_REDIS_HOST=redis
+      - SPRING_RABBITMQ_HOST=rabbitmq
+      - SPRING_RABBITMQ_USERNAME=${RABBITMQ_USER:-mansicha}
+      - SPRING_RABBITMQ_PASSWORD=${RABBITMQ_PASSWORD:-mansicha123}
+      - VECTOR_QDRANT_HOST=qdrant
+      - VECTOR_MILVUS_ENABLED=${MILVUS_ENABLED:-false}
+      - VECTOR_MILVUS_HOST=milvus
+      # 开启远程调试
+      - JAVA_OPTS=-XX:+UseContainerSupport -XX:MaxRAMPercentage=70 -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=*:5005
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      nacos:
+        condition: service_started
+    restart: unless-stopped
+    networks: [ms-net]
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ============ 老项目 ============
+  tear-spring:
+    image: mansicha/tear-spring:demo
+    container_name: ms-tear-spring
+    ports:
+      - "8080:8080"
+      - "5006:5005"
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:mysql://mysql:3306/db_tear?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+      - SPRING_DATASOURCE_USERNAME=root
+      - SPRING_DATASOURCE_PASSWORD=${MYSQL_PASSWORD:-root}
+      - SPRING_DATA_REDIS_HOST=redis
+      - SPRING_CLOUD_NACOS_DISCOVERY_SERVER_ADDR=nacos:8848
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [ms-net]
+
+  # ============ MySQL ============
+  mysql:
+    image: mysql:8.0
+    container_name: ms-mysql
+    ports:
+      - "3306:3306"        # 演示版开放，方便用 Navicat 连
+    environment:
+      - MYSQL_ROOT_PASSWORD=${MYSQL_PASSWORD:-root}
+      - TZ=Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-authentication-plugin=mysql_native_password
+      - --innodb-buffer-pool-size=512M
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 首次启动自动导入 Agent 侧表结构
+      - ./sql:/docker-entrypoint-initdb.d:ro
+      # 老项目 SQL 也挂进去（首次启动会执行）
+      # - ../2026027318-02素材与源码/源码:/legacy-sql:ro
+    restart: unless-stopped
+    networks: [ms-net]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # ============ Redis ============
+  redis:
+    image: redis:7.2-alpine
+    container_name: ms-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks: [ms-net]
+
+  # ============ RabbitMQ ============
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: ms-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=${RABBITMQ_USER:-mansicha}
+      - RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASSWORD:-mansicha123}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: unless-stopped
+    networks: [ms-net]
+
+  # ============ Nacos ============
+  nacos:
+    image: nacos/nacos-server:v2.3.2
+    container_name: ms-nacos
+    ports:
+      - "8848:8848"
+      - "9848:9848"
+    environment:
+      - MODE=standalone
+      - PREFER_HOST_MODE=hostname
+      - JVM_XMS=256m
+      - JVM_XMX=512m
+    volumes:
+      - nacos_data:/home/nacos/data
+    restart: unless-stopped
+    networks: [ms-net]
+
+  # ============ Qdrant ============
+  qdrant:
+    image: qdrant/qdrant:v1.7.4
+    container_name: ms-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    networks: [ms-net]
+
+  # ============ Milvus（对比实验时才启，profile 控制）============
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: ms-etcd
+    profiles: ["milvus"]
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    networks: [ms-net]
+
+  minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: ms-minio
+    profiles: ["milvus"]
+    environment:
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    networks: [ms-net]
+
+  milvus:
+    image: milvusdb/milvus:v2.3.9
+    container_name: ms-milvus
+    profiles: ["milvus"]
+    command: ["milvus", "run", "standalone"]
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+    volumes:
+      - milvus_data:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    depends_on:
+      - etcd
+      - minio
+    networks: [ms-net]
+
+volumes:
+  mysql_data:
+  redis_data:
+  rabbitmq_data:
+  nacos_data:
+  qdrant_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+
+networks:
+  ms-net:
+    driver: bridge
