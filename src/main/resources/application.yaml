@@ -26,7 +26,7 @@ spring:
     driver-class-name: com.mysql.cj.jdbc.Driver
     url: jdbc:mysql://localhost:3306/db_agent?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
     username: root
-    password: root
+    password: ${DB_PASSWORD:123456}   # 本机 MySQL 实际密码；生产用环境变量覆盖
 
   data:
     redis:
