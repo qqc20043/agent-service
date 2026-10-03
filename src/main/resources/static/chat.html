@@ -109,6 +109,10 @@ async function ask() {
       headers: { 'Content-Type': 'application/json; charset=utf-8' },
       body: JSON.stringify({ message: text, sessionId })
     });
+    if (!resp.ok) {
+      bot.textContent = '[请求失败] HTTP ' + resp.status + '，请查看后端日志';
+      busy = false; send.disabled = false; return;
+    }
     const reader = resp.body.getReader();
     const decoder = new TextDecoder('utf-8');
     let buf = '';
@@ -134,14 +138,15 @@ async function ask() {
           add('event', '🔧 调用工具：' + (j.name || j.type) + ' ' + (j.args || ''));
         } else if (event === 'done') {
           const j = JSON.parse(data);
-          for (const [k, v] of Object.entries({
-            '耗时 ' + j.latencyMs + 'ms': 1,
-            'tokens ' + (j.promptTokens ?? 0) + '+' + (j.completionTokens ?? 0): 1,
-            '成本 ¥' + Number(j.costYuan).toFixed(6): 1,
-            'trace ' + String(j.traceId).slice(0, 8): 1
-          })) {
+          const chips = [
+            '耗时 ' + j.latencyMs + 'ms',
+            'tokens ' + (j.promptTokens ?? 0) + '+' + (j.completionTokens ?? 0),
+            '成本 ¥' + Number(j.costYuan).toFixed(6),
+            'trace ' + String(j.traceId).slice(0, 8)
+          ];
+          for (const t of chips) {
             const c = document.createElement('span');
-            c.className = 'chip'; c.textContent = k;
+            c.className = 'chip'; c.textContent = t;
             stats.appendChild(c);
           }
           chat.scrollTop = chat.scrollHeight;
