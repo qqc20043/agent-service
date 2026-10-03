@@ -39,6 +39,7 @@ public class AgentChatController {
 
     private final AgentOrchestrator orchestrator;
     private final SessionMemoryService memoryService;
+    private final LlmClient llmClient;
 
     /** 专用线程池：Agent 任务可能跑十几秒，不能占 Tomcat 线程 */
     private final ExecutorService agentPool = Executors.newFixedThreadPool(16, r -> {

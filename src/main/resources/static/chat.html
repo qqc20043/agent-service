@@ -53,12 +53,12 @@
     <span class="badge">agent-service <b id="st-agent">…</b></span>
     <span class="badge">tearSpring <b id="st-tear">…</b></span>
     <span class="badge">Nacos <b>8848</b></span>
-    <span class="badge">LLM <b id="st-llm">deepseek-v4.1-flash</b></span>
+    <span class="badge">LLM <b id="st-llm">…</b></span>
   </div>
 </header>
 
 <div id="chat">
-  <div class="bot">你好，我是漫思茶的智能茶饮顾问 🍵<br>试试问我：「推荐几款绿茶」「送长辈什么茶合适」「有哪些茶叶分类」<br>（当前接入 Mock LLM 演示流式链路，真实大模型接入后回答更智能）</div>
+  <div class="bot">你好，我是漫思茶的智能茶饮顾问 🍵<br>试试问我：「推荐几款绿茶」「送长辈什么茶合适」「有哪些茶叶分类」<br><span id="intro-note">（正在读取后端 LLM 配置…）</span></div>
 </div>
 
 <div class="tip">curl -N -X POST /api/agent/chat/stream · SSE 事件流：meta → delta×N → done（traceId + token 计量 + 成本）</div>
@@ -92,6 +92,25 @@ async function checkStatus() {
   } catch (e) { document.getElementById('st-agent').textContent = '离线'; }
 }
 checkStatus();
+
+// LLM 运行态由后端 /api/agent/llm-info 提供，页面不写死模型名
+async function checkLlm() {
+  const badge = document.getElementById('st-llm');
+  const note = document.getElementById('intro-note');
+  try {
+    const r = await fetch('/api/agent/llm-info');
+    const j = await r.json();
+    badge.textContent = j.model + (j.mock ? '（Mock）' : '');
+    badge.style.color = j.mock ? '#e8c46a' : '#8fd694';
+    note.textContent = j.mock
+      ? '（当前为 Mock LLM：' + j.endpoint + '，仅演示流式链路，回答为固定文案）'
+      : '（当前接入真实大模型 ' + j.model + ' @ ' + j.endpoint + '，SSE 流式 + token 计量 + 成本核算）';
+  } catch (e) {
+    badge.textContent = '未知';
+    note.textContent = '（读取 LLM 配置失败，请查看后端日志）';
+  }
+}
+checkLlm();
 
 async function ask() {
   const text = q.value.trim();
