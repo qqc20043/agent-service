@@ -46,9 +46,13 @@ public class LlmClient {
     @Value("${llm.retry-backoff-ms:800}")
     private long retryBackoffMs;
 
+    /** 保留 baseUrl 供 /api/agent/llm-info 暴露运行态（只暴露主机名，不暴露 Key） */
+    private final String baseUrl;
+
     public LlmClient(@Value("${llm.base-url}") String baseUrl,
                      @Value("${llm.api-key}") String apiKey,
                      @Value("${llm.timeout-seconds:60}") long timeoutSeconds) {
+        this.baseUrl = baseUrl;
         this.webClient = WebClient.builder()
                 .baseUrl(baseUrl)
                 .defaultHeader("Authorization", "Bearer " + apiKey)
@@ -232,6 +236,32 @@ public class LlmClient {
             return w.getStatusCode().is5xxServerError() || w.getStatusCode().value() == 429;
         }
         return true; // 连接层异常
+    }
+
+    // ==================== 运行态自描述 ====================
+
+    /**
+     * 暴露当前生效的 LLM 配置，供前端徽章展示与排障。
+     * <p><b>刻意只返回 baseUrl 的 host，绝不返回 apiKey</b>——这个端点若部署到公网，
+     * 泄露 Key 就是真实的金钱损失（见需求汇总 §6.3 安全红线）。
+     */
+    public java.util.Map<String, Object> describe() {
+        String host = baseUrl;
+        boolean mock = false;
+        try {
+            java.net.URI u = java.net.URI.create(baseUrl);
+            host = u.getHost() + (u.getPort() > 0 ? ":" + u.getPort() : "");
+            // 本地回环 = Mock/自测环境，前端据此显示 Mock 标记
+            mock = "127.0.0.1".equals(u.getHost()) || "localhost".equalsIgnoreCase(u.getHost());
+        } catch (Exception ignored) {
+            // baseUrl 非法时原样返回，便于发现配置错误
+        }
+        java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+        m.put("model", chatModel);
+        m.put("endpoint", host);
+        m.put("mock", mock);
+        m.put("maxRetries", maxRetries);
+        return m;
     }
 
     // ==================== 数据载体 ====================

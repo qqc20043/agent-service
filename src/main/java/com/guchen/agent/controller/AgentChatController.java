@@ -1,6 +1,7 @@
 package com.guchen.agent.controller;
 
 import com.guchen.agent.agent.AgentOrchestrator;
+import com.guchen.agent.llm.LlmClient;
 import com.guchen.agent.memory.SessionMemoryService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
@@ -116,6 +117,15 @@ public class AgentChatController {
     public Map<String, Object> clear(@PathVariable String sessionId) {
         memoryService.clear(sessionId);
         return Map.of("cleared", true, "sessionId", sessionId);
+    }
+
+    /**
+     * 当前生效的 LLM 运行态（模型名 / 端点 host / 是否 Mock / 重试次数）。
+     * 前端徽章据此显示，避免把模型名写死在页面里；<b>不含 apiKey</b>。
+     */
+    @GetMapping("/llm-info")
+    public Map<String, Object> llmInfo() {
+        return llmClient.describe();
     }
 
     private void send(SseEmitter emitter, AtomicBoolean closed, String event, Object data) {
