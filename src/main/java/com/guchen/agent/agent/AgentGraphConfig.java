@@ -134,8 +134,8 @@ public class AgentGraphConfig {
                     boolean sufficient = (Boolean) state.value("sufficient").orElse(false);
                     int round = (Integer) state.value("round").orElse(1);
                     // 命中充足 或 已达重试上限 → 生成推荐；否则扩大检索
-                    if (sufficient || round >= 2) return NODE_RECOMMEND;
-                    return NODE_EXPAND;
+                    return CompletableFuture.completedFuture(
+                            (sufficient || round >= 2) ? NODE_RECOMMEND : NODE_EXPAND);
                 },
                 Map.of(NODE_RECOMMEND, NODE_RECOMMEND, NODE_EXPAND, NODE_EXPAND));
 

@@ -58,7 +58,8 @@ public class QdrantVectorStore implements VectorStore {
     @Override
     public void ensureCollection(int dimension) {
         try {
-            boolean exists = client.collectionExistsAsync(collection).get(5, TimeUnit.SECONDS);
+            boolean exists = client.listCollectionsAsync().get(5, TimeUnit.SECONDS)
+                    .contains(collection);
             if (exists) {
                 log.info("Qdrant 集合已存在: {}", collection);
                 return;
@@ -114,7 +115,7 @@ public class QdrantVectorStore implements VectorStore {
                     .setCollectionName(collection)
                     .addAllVector(toFloatList(queryVector))
                     .setLimit(topK)
-                    .setWithPayload(Points.WithPayloadEnable.newBuilder().setEnable(true).build());
+                    .setWithPayload(Points.WithPayloadSelector.newBuilder().setEnable(true).build());
 
             List<Points.ScoredPoint> scored = client.searchAsync(req.build()).get(15, TimeUnit.SECONDS);
 
