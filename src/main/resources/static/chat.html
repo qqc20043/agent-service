@@ -42,6 +42,9 @@
   #send { background: #2f6e46; color: #fff; }
   #send:disabled { background: #35503f; cursor: not-allowed; }
   #dag { background: rgba(255,255,255,.08); color: #b9cdbf; }
+  .stats button { padding: 6px 14px; font-size: 12px; border-radius: 8px; border: none; cursor: pointer; }
+  .stats button.btn-confirm { background: #2f6e46; color: #fff; }
+  .stats button.btn-cancel { background: rgba(255,255,255,.1); color: #c9d6cc; }
   .tip { text-align: center; font-size: 11px; color: #7d9488; padding-bottom: 10px; }
 </style>
 </head>
@@ -81,6 +84,24 @@ function add(cls, text) {
   d.className = cls; d.textContent = text;
   chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
   return d;
+}
+
+let pendingConfirm = null;
+function renderConfirmButtons(token) {
+  const bar = document.createElement('div');
+  bar.className = 'stats';
+  const yes = document.createElement('button');
+  yes.textContent = '✅ 确认下单';
+  const no = document.createElement('button');
+  no.textContent = '❌ 取消';
+  yes.onclick = () => { bar.remove(); queueSend('确认下单，令牌 ' + token); };
+  no.onclick = () => { bar.remove(); queueSend('取消订单，令牌 ' + token); };
+  bar.appendChild(yes); bar.appendChild(no);
+  chat.appendChild(bar); chat.scrollTop = chat.scrollHeight;
+}
+function queueSend(text) {
+  if (busy) { pendingConfirm = text; return; }
+  q.value = text; ask();
 }
 
 async function checkStatus() {
@@ -154,7 +175,12 @@ async function ask() {
           chat.scrollTop = chat.scrollHeight;
         } else if (event === 'tool') {
           const j = JSON.parse(data);
-          add('event', '🔧 调用工具：' + (j.name || j.type) + ' ' + (j.args || ''));
+          if (j.type === 'confirm_ready') {
+            add('event', '📋 拟单就绪：' + j.summary);
+            renderConfirmButtons(j.confirmToken);
+          } else {
+            add('event', '🔧 调用工具：' + (j.name || j.type) + ' ' + (j.args || ''));
+          }
         } else if (event === 'done') {
           const j = JSON.parse(data);
           const chips = [
@@ -178,6 +204,7 @@ async function ask() {
     bot.textContent += '\n[连接失败] ' + e.message;
   }
   busy = false; send.disabled = false; q.focus();
+  if (pendingConfirm) { const t = pendingConfirm; pendingConfirm = null; q.value = t; ask(); }
 }
 
 send.onclick = ask;

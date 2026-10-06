@@ -1,5 +1,6 @@
 package com.guchen.agent.agent;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.guchen.agent.client.FeignAuthConfig;
@@ -61,6 +62,9 @@ public class AgentOrchestrator {
             3. 回答茶知识问题时，优先使用检索到的知识片段，并在末尾标注引用来源。
             4. 工具返回 degraded=true 表示后端服务不可用，如实告知用户稍后重试，不要编造结果。
             5. 回答简洁专业，不啰嗦，不使用夸张营销话术。
+            6. 下单必须走确认流：先调用 prepare_order 拟单，把拟单内容（商品/规格/数量/合计/收货地址）
+               完整复述给用户，等用户明确回复同意后才调用 confirm_order。用户未确认绝不 confirm；
+               金额与商品信息一律以工具返回为准，禁止自行计算或编造价格。
             """;
 
     /**
@@ -152,6 +156,20 @@ public class AgentOrchestrator {
                     // 幂等与可观测：写操作单独落表
                     trace.recordToolCall(traceId, call.name(), call.arguments(), latency, isWrite);
 
+                    // 确认流：prepare_order 拟单完成后，向前端推送结构化确认事件（渲染确认/取消按钮）
+                    if ("prepare_order".equals(call.name())) {
+                        try {
+                            JsonNode out = mapper.readTree(output);
+                            if (out.hasNonNull("confirmToken")) {
+                                onToolEvent.accept(Map.of(
+                                        "type", "confirm_ready",
+                                        "confirmToken", out.path("confirmToken").asText(),
+                                        "summary", draftSummary(out.path("draft"))));
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    }
+
                     messages.add(Message.tool(call.id(), call.name(), truncate(output, 4000)));
                 }
             }
@@ -201,20 +219,28 @@ public class AgentOrchestrator {
         String q = input.toLowerCase();
 
         if (containsAny(q, "下单", "购买", "买", "结算", "order"))
-            return List.of("search_tea", "get_tea_detail", "create_order", "add_to_cart");
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "view_cart",
+                    "prepare_order", "confirm_order", "cancel_order");
         if (containsAny(q, "购物车", "加购", "cart"))
-            return List.of("search_tea", "get_tea_detail", "add_to_cart");
+            return List.of("view_cart", "add_to_cart", "remove_from_cart", "search_tea", "get_tea_detail");
+        if (containsAny(q, "订单", "history", "买的"))
+            return List.of("list_orders");
         if (containsAny(q, "优惠券", "券", "兑换", "coupon"))
-            return List.of("redeem_coupon");
+            return List.of("list_coupons", "redeem_coupon");
+        if (containsAny(q, "地址", "收货"))
+            return List.of("list_addresses");
         if (containsAny(q, "分类", "有哪些种类", "品类", "category"))
             return List.of("list_categories", "list_themes");
         if (containsAny(q, "店铺", "茶铺", "shop"))
             return List.of("list_shop_products");
         if (containsAny(q, "主题", "系列", "theme"))
             return List.of("list_themes");
+        if (containsAny(q, "确认", "好的", "可以", "同意", "没错"))
+            return List.of("confirm_order", "cancel_order", "prepare_order", "search_tea", "get_tea_detail");
 
         // 兜底：只读工具
-        return List.of("search_tea", "get_tea_detail", "list_themes", "list_categories");
+        return List.of("search_tea", "get_tea_detail", "list_themes", "list_categories",
+                "view_cart", "list_orders");
     }
 
     /** 判断是否需要走 RAG：问「是什么/怎么/为什么/区别」这类知识题才检索。 */
@@ -232,6 +258,15 @@ public class AgentOrchestrator {
     private String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() <= max ? s : s.substring(0, max) + "...(截断)";
+    }
+
+    /** 把拟单压成一行摘要，供前端确认按钮展示。 */
+    private String draftSummary(JsonNode draft) {
+        return draft.path("productEmoji").asText("") + " "
+                + draft.path("productName").asText("") + "（" + draft.path("specName").asText() + "）"
+                + " ×" + draft.path("quantity").asInt()
+                + " = ¥" + draft.path("subtotal").asDouble()
+                + "，送 " + draft.path("addressSummary").asText("");
     }
 
     /** 把完整答案切成小片做流式呈现。 */

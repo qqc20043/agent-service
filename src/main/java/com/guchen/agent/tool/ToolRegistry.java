@@ -28,6 +28,7 @@ import java.util.function.Function;
 public class ToolRegistry {
 
     private final TearSpringClient tearSpring;
+    private final TradeToolService trade;
     private final ObjectMapper mapper = new ObjectMapper();
 
     /** 工具名 → 定义 */
@@ -75,13 +76,54 @@ public class ToolRegistry {
                         List.of("productId", "specId", "quantity")), true,
                 args -> tearSpring.addToCart(args));
 
-        register("create_order", "创建订单",
-                params(Map.of("addressId", "integer", "specIds", "array"), List.of("addressId")), true,
-                args -> tearSpring.createOrder(args));
-
+        // 注：旧的直连下单工具 create_order 已移除——下单一律走 prepare_order → 用户确认 → confirm_order，
+        // 防止 LLM 绕过确认流直接创建订单（见升级方案 §2.2）。
         register("redeem_coupon", "使用券号兑换优惠券",
                 params(Map.of("code", "string", "password", "string"), List.of("code", "password")), true,
                 args -> tearSpring.redeemCoupon(args));
+
+        // ---------- 交易闭环（Phase 1，见《漫思茶-Agent任务化升级方案》） ----------
+        register("view_cart", "查看当前用户购物车（含每项价格/数量/小计）",
+                emptyParams(), false,
+                args -> tearSpring.cartDetail());
+
+        register("remove_from_cart", "把一个商品项从购物车移除",
+                params(Map.of("cartItemId", "integer"), List.of("cartItemId")), true,
+                args -> tearSpring.removeFromCart(Map.of("id", args.path("cartItemId").asInt())));
+
+        register("list_orders", "查询当前用户的历史订单与明细（订单号/状态/商品/金额）",
+                emptyParams(), false,
+                args -> tearSpring.orderItemDetail());
+
+        register("list_addresses", "查询当前用户收货地址列表",
+                emptyParams(), false,
+                args -> tearSpring.addressList());
+
+        register("list_coupons", "查询当前用户已领取的优惠券",
+                emptyParams(), false,
+                args -> tearSpring.couponUserList());
+
+        register("user_profile", "查询当前登录用户的个人信息",
+                emptyParams(), false,
+                args -> tearSpring.userData());
+
+        // ---------- 下单确认流（human-in-the-loop） ----------
+        register("prepare_order", "拟单：按商品/规格/数量/地址生成待确认的订单草稿与一次性确认令牌。"
+                        + "不会真正下单。specId 不要猜测：用户未明确规格时必须省略（自动取默认规格）；"
+                        + "要指定规格时 specId 只能取自 get_tea_detail 返回的 productSpecs。"
+                        + "返回的 draft 必须完整复述给用户并等待确认。",
+                params(Map.of("productId", "integer", "specId", "integer", "quantity", "integer", "addressId", "integer"),
+                        List.of("productId")), false,
+                args -> trade.prepareOrder(args));
+
+        register("confirm_order", "确认执行下单：用户明确同意后，凭 prepare_order 返回的 confirmToken 创建真实订单。"
+                        + "令牌一次性，重复调用会失败。",
+                params(Map.of("confirmToken", "string"), List.of("confirmToken")), true,
+                args -> trade.confirmOrder(args));
+
+        register("cancel_order", "取消拟单：用户反悔时作废确认令牌",
+                params(Map.of("confirmToken", "string"), List.of("confirmToken")), true,
+                args -> trade.cancelOrder(args));
 
         log.info("工具注册完成，共 {} 个工具", registry.size());
     }
