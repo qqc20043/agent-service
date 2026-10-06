@@ -54,9 +54,10 @@ public class ToolRegistry {
                 params(Map.of("keyword", "string"), List.of("keyword")), false,
                 args -> searchTea(args.path("keyword").asText()));
 
-        register("get_tea_detail", "获取单个茶叶商品的详细信息与规格",
+        register("get_tea_detail", "获取单个茶叶商品的详细信息与规格。"
+                        + "productId 必须来自 search_tea 的真实结果，禁止编造或凭记忆推测",
                 params(Map.of("productId", "integer"), List.of("productId")), false,
-                args -> tearSpring.productDetail(Map.of("id", args.path("productId").asInt())));
+                args -> getTeaDetail(args.path("productId").asLong()));
 
         register("list_themes", "获取所有茶文化主题列表",
                 emptyParams(), false,
@@ -71,10 +72,10 @@ public class ToolRegistry {
                 args -> tearSpring.shopProducts(Map.of("id", args.path("shopId").asInt())));
 
         // ---------- 写操作工具（需幂等） ----------
-        register("add_to_cart", "将商品加入购物车",
+        register("add_to_cart", "将商品加入购物车。productId/specId 必须来自 search_tea 与 get_tea_detail 的真实结果，禁止编造",
                 params(Map.of("productId", "integer", "specId", "integer", "quantity", "integer"),
                         List.of("productId", "specId", "quantity")), true,
-                args -> tearSpring.addToCart(args));
+                args -> addToCartValidated(args));
 
         // 注：旧的直连下单工具 create_order 已移除——下单一律走 prepare_order → 用户确认 → confirm_order，
         // 防止 LLM 绕过确认流直接创建订单（见升级方案 §2.2）。
@@ -189,6 +190,55 @@ public class ToolRegistry {
         return registry.keySet();
     }
 
+    // ==================== 商品 id/specId 强校验（防 LLM 编造） ====================
+
+    /**
+     * 详情查询前先验 id 真实性。老项目 /product/selectSingle 对不存在的 id
+     * 会静默返回空规格（不报错），LLM 只能对着空数据发呆——必须在工具层拦下，
+     * 并给出「重新 search_tea」的可行动指引。
+     */
+    private String getTeaDetail(long productId) {
+        JsonNode product = findProductInList(productId);
+        if (product == null) {
+            return err("商品 id=" + productId + " 不存在。productId 必须来自 search_tea 返回的真实结果——"
+                    + "请按商品名重新调用 search_tea 获取正确 id，不要凭记忆或推测编造");
+        }
+        return tearSpring.productDetail(Map.of("id", (int) productId));
+    }
+
+    /** 加购前校验：商品存在 + specId 属于该商品（否则老项目会加进一个幽灵组合）。 */
+    private String addToCartValidated(JsonNode args) {
+        long productId = args.path("productId").asLong(0);
+        long specId = args.path("specId").asLong(0);
+        int quantity = args.path("quantity").asInt(0);
+        if (productId <= 0) return err("productId 必填（来自 search_tea 真实结果）");
+        JsonNode product = findProductInList(productId);
+        if (product == null) {
+            return err("商品 id=" + productId + " 不存在。请按商品名重新调用 search_tea 获取正确 id");
+        }
+        JsonNode specs;
+        try {
+            specs = mapper.readTree(tearSpring.productDetail(Map.of("id", (int) productId))).path("productSpecs");
+        } catch (Exception e) {
+            return err("查询规格失败: " + e.getMessage());
+        }
+        boolean specOk = false;
+        StringBuilder avail = new StringBuilder();
+        for (JsonNode s : specs) {
+            avail.append(s.path("id").asLong()).append("=").append(s.path("specName").asText()).append(" ");
+            if (s.path("id").asLong() == specId) specOk = true;
+        }
+        if (!specOk) {
+            return err("规格 id=" + specId + " 不属于商品「" + product.path("name").asText()
+                    + "」。可用规格: " + avail.toString().trim() + "——请从 get_tea_detail 的 productSpecs 里选");
+        }
+        if (quantity <= 0) return err("数量需大于 0");
+        ObjectNode body = mapper.createObjectNode()
+                .put("productId", productId).put("specId", specId)
+                .put("quantity", quantity).put("checked", 1);
+        return tearSpring.addToCart(body);
+    }
+
     // ==================== agent 侧搜索过滤 ====================
 
     private static final int SEARCH_MAX_RESULTS = 10;
@@ -230,6 +280,26 @@ public class ToolRegistry {
             log.warn("search_tea 过滤失败，退回原始结果: {}", e.getMessage());
             return raw;
         }
+    }
+
+    private String err(String msg) {
+        try {
+            return mapper.writeValueAsString(mapper.createObjectNode().put("error", msg));
+        } catch (Exception e) {
+            return "{\"error\":\"序列化失败\"}";
+        }
+    }
+
+    /** 在全量商品列表里定位商品（校验 id 真实性用）；找不到返回 null。 */
+    private JsonNode findProductInList(long productId) {
+        try {
+            JsonNode list = mapper.readTree(tearSpring.searchProductRaw()).path("ShopSpecList");
+            for (JsonNode item : list) {
+                if (item.path("id").asLong() == productId) return item;
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     // ==================== JSON Schema 构造辅助 ====================
