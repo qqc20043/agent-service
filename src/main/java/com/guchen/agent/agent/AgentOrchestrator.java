@@ -115,6 +115,7 @@ public class AgentOrchestrator {
 
             // ---------- 3. ReAct 循环（受控自主） ----------
             String finalAnswer = null;
+            boolean authExpired = false;
             for (int i = 0; i < maxIterations; i++) {
                 // 走流式分片重组而非非流式：网关非流式会丢 tool_calls（见 LlmClient#chatViaStream）
                 ChatResult result = llm.chatViaStream(messages, toolsSchema);
@@ -158,10 +159,13 @@ public class AgentOrchestrator {
 
                     // 鉴权失败短路：老项目返回 401（token 过期）时不再进 LLM 轮次组织道歉文，
                     // 而是推确定性 auth_expired 事件（前端据此引导重新登录）+ 固定文案收口。
-                    // 检测覆盖两条路径：Feign 降级的 authFailed 标记 / 错误文本里的 401。
+                    // 注意：这里在内层工具循环里，必须用标志位退出「外层」ReAct 循环——
+                    // 直接 break 只跳出内层，下一轮 LLM 会带着「有 tool_calls 无 tool 结果」
+                    // 的断裂消息序列被网关以 400 拒绝（首版实测踩中）。
                     if (output.contains("\"authFailed\":true") || output.contains("401")) {
                         onToolEvent.accept(Map.of("type", "auth_expired"));
                         finalAnswer = "🔑 登录已过期，请重新登录后再继续，我在这等你回来。";
+                        authExpired = true;
                         break;
                     }
 
@@ -181,6 +185,9 @@ public class AgentOrchestrator {
 
                     messages.add(Message.tool(call.id(), call.name(), truncate(output, 4000)));
                 }
+
+                // 鉴权失败：从内层工具循环带标志退出外层 ReAct 循环
+                if (authExpired) break;
             }
 
             if (finalAnswer == null) {

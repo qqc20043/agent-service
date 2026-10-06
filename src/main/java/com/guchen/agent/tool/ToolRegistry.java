@@ -176,7 +176,11 @@ public class ToolRegistry {
             return result;
         } catch (Exception e) {
             log.warn("工具 {} 执行失败: {}", name, e.getMessage());
-            return "{\"error\":\"" + e.getMessage().replace("\"", "'") + "\"}";
+            String msg = String.valueOf(e.getMessage()).replace("\"", "'");
+            // Feign fallbackFactory 在未启用 circuit breaker 时不生效（本项目即此配置），
+            // 401 等异常会直接抛到这里——在此打鉴权标记供编排器短路
+            boolean authFailed = msg.contains("[401]") || msg.contains("401 Unauthorized");
+            return "{\"error\":\"" + msg + "\",\"authFailed\":" + authFailed + "}";
         }
     }
 
