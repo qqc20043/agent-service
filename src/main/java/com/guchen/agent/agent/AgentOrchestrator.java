@@ -46,6 +46,8 @@ public class AgentOrchestrator {
     private final SessionMemoryService memory;
     private final AgentTraceService trace;
     private final ObjectMapper mapper;
+    private final com.guchen.agent.memory.UserContextService userContext;
+    private final com.guchen.agent.memory.UserProfileService userProfile;
 
     @Value("${agent.max-iterations:6}")
     private int maxIterations;
@@ -91,6 +93,14 @@ public class AgentOrchestrator {
             // token 透传给 Feign，让老项目能做鉴权
             FeignAuthConfig.setToken(token);
 
+            // ---------- 0. 用户身份与记忆归属 ----------
+            // 登录用户 → 记忆域按 userId（跨会话/跨设备），并注入订单画像；
+            // 未登录/token 失效 → 退回会话级（匿名），画像为空不影响流程
+            Long userId = userContext.resolveUserId(token);
+            String memoryScope = (userId != null) ? ("u" + userId) : ("s" + sessionId);
+            String profileLine = (userId != null) ? userProfile.profileContext(token, userId) : "";
+            log.debug("[{}] 记忆域: {} (userId={})", traceId, memoryScope, userId);
+
             // ---------- 1. 意图路由（确定性） ----------
             List<String> candidateTools = routeIntent(userInput);
             ArrayNode toolsSchema = tools.buildToolsSchema(candidateTools);
@@ -99,6 +109,11 @@ public class AgentOrchestrator {
             // ---------- 2. 组装上下文 ----------
             List<Message> messages = new ArrayList<>();
             messages.add(Message.system(SYSTEM_PROMPT));
+
+            // 用户画像（来自真实订单，登录用户专属）
+            if (!profileLine.isBlank()) {
+                messages.add(Message.system("已核实的用户画像（来自其真实订单记录，推荐时可引用）：\n" + profileLine));
+            }
 
             // RAG：茶知识检索（仅在疑似知识类问题时触发，省 token）
             if (needsKnowledge(userInput)) {
@@ -109,8 +124,8 @@ public class AgentOrchestrator {
                 }
             }
 
-            // 多轮记忆
-            messages.addAll(memory.loadHistory(sessionId));
+            // 多轮记忆（登录用户跨会话共享）
+            messages.addAll(memory.loadHistory(memoryScope));
             messages.add(Message.user(userInput));
 
             // ---------- 3. ReAct 循环（受控自主） ----------
@@ -183,6 +198,11 @@ public class AgentOrchestrator {
                         }
                     }
 
+                    // 画像：确认下单成功后失效缓存，下一轮按新订单重建
+                    if (output.contains("ORDER_CREATED") && userId != null) {
+                        userProfile.invalidate(userId);
+                    }
+
                     messages.add(Message.tool(call.id(), call.name(), truncate(output, 4000)));
                 }
 
@@ -204,7 +224,7 @@ public class AgentOrchestrator {
 
             // ---------- 5. 落库与记忆 ----------
             int latencyMs = (int) (System.currentTimeMillis() - start);
-            memory.append(sessionId, userInput, finalAnswer);
+            memory.append(memoryScope, userInput, finalAnswer);
             trace.recordTrace(traceId, sessionId, "agent.run",
                     totalPromptTokens, totalCompletionTokens, latencyMs);
 
