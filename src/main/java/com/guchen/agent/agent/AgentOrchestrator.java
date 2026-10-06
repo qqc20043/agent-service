@@ -156,6 +156,15 @@ public class AgentOrchestrator {
                     // 幂等与可观测：写操作单独落表
                     trace.recordToolCall(traceId, call.name(), call.arguments(), latency, isWrite);
 
+                    // 鉴权失败短路：老项目返回 401（token 过期）时不再进 LLM 轮次组织道歉文，
+                    // 而是推确定性 auth_expired 事件（前端据此引导重新登录）+ 固定文案收口。
+                    // 检测覆盖两条路径：Feign 降级的 authFailed 标记 / 错误文本里的 401。
+                    if (output.contains("\"authFailed\":true") || output.contains("401")) {
+                        onToolEvent.accept(Map.of("type", "auth_expired"));
+                        finalAnswer = "🔑 登录已过期，请重新登录后再继续，我在这等你回来。";
+                        break;
+                    }
+
                     // 确认流：prepare_order 拟单完成后，向前端推送结构化确认事件（渲染确认/取消按钮）
                     if ("prepare_order".equals(call.name())) {
                         try {

@@ -16,10 +16,15 @@ public class TearSpringClientFallback implements FallbackFactory<TearSpringClien
     @Override
     public TearSpringClient create(Throwable cause) {
         log.warn("tearSpring 服务调用失败，进入降级: {}", cause.getMessage());
+        // 鉴权失败（token 过期/无效）单独标记：编排器据此推 auth_expired 事件、
+        // 前端引导重新登录，而不是让 LLM 自由发挥道歉（确定性降级路径）
+        final boolean authFailed = cause instanceof feign.FeignException fe && fe.status() == 401;
         return new TearSpringClient() {
             private String degrade(String api) {
-                return "{\"degraded\":true,\"api\":\"" + api
-                        + "\",\"message\":\"商品服务暂时不可用，请稍后重试\"}";
+                return "{\"degraded\":true,\"authFailed\":" + authFailed
+                        + ",\"api\":\"" + api
+                        + "\",\"message\":\"" + (authFailed ? "登录已过期，请重新登录" : "商品服务暂时不可用，请稍后重试")
+                        + "\"}";
             }
             @Override public String productDetail(java.util.Map<String, Object> b) { return degrade("productDetail"); }
             @Override public String shopSpecList() { return degrade("shopSpecList"); }

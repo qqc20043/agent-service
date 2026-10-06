@@ -178,6 +178,8 @@ async function ask() {
           if (j.type === 'confirm_ready') {
             add('event', '📋 拟单就绪：' + j.summary);
             renderConfirmButtons(j.confirmToken);
+          } else if (j.type === 'auth_expired') {
+            add('event', '🔑 登录已过期，请重新登录后再试');
           } else {
             add('event', '🔧 调用工具：' + (j.name || j.type) + ' ' + (j.args || ''));
           }
