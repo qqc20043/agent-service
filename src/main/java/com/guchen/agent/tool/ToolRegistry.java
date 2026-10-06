@@ -47,9 +47,11 @@ public class ToolRegistry {
         if (!registry.isEmpty()) return;
 
         // ---------- 只读工具 ----------
-        register("search_tea", "按关键词搜索茶叶商品，返回商品列表",
+        // 老项目 /product/shopSpecList 无关键词参数、恒返回全量商品（实测 48 条 / 约 3000 prompt tokens），
+        // 因此在这里做 agent 侧关键词过滤，最多返回 10 条——修掉「假搜索」并压 token 成本
+        register("search_tea", "按关键词搜索茶叶商品，返回匹配的商品列表（最多 10 条）",
                 params(Map.of("keyword", "string"), List.of("keyword")), false,
-                args -> tearSpring.searchProduct(args.path("keyword").asText()));
+                args -> searchTea(args.path("keyword").asText()));
 
         register("get_tea_detail", "获取单个茶叶商品的详细信息与规格",
                 params(Map.of("productId", "integer"), List.of("productId")), false,
@@ -139,6 +141,49 @@ public class ToolRegistry {
     public java.util.Set<String> allToolNames() {
         ensureInitialized();
         return registry.keySet();
+    }
+
+    // ==================== agent 侧搜索过滤 ====================
+
+    private static final int SEARCH_MAX_RESULTS = 10;
+
+    /**
+     * 拉全量商品后按关键词过滤（匹配整条 JSON 文本，对字段命名不敏感），
+     * 返回结构与原始 ShopSpecList 一致并附 matched/totalScanned 供 LLM 判断。
+     * 空关键词返回封顶的全量列表。
+     */
+    private String searchTea(String keyword) {
+        String raw = tearSpring.searchProductRaw();
+        try {
+            JsonNode root = mapper.readTree(raw);
+            JsonNode list = root.path("ShopSpecList");
+            if (!list.isArray()) return raw;
+
+            String kw = keyword == null ? "" : keyword.trim().toLowerCase();
+            ArrayNode filtered = mapper.createArrayNode();
+            int scanned = list.size();
+            for (JsonNode item : list) {
+                if (filtered.size() >= SEARCH_MAX_RESULTS) break;
+                if (kw.isEmpty() || item.toString().toLowerCase().contains(kw)) {
+                    filtered.add(item);
+                }
+            }
+
+            ObjectNode out = mapper.createObjectNode();
+            out.put("msg", kw.isEmpty() ? "返回全部商品（已截断）" : "按关键词「" + keyword + "」过滤商品");
+            out.put("code", 200);
+            out.put("matched", filtered.size());
+            out.put("totalScanned", scanned);
+            if (filtered.isEmpty()) {
+                out.put("hint", "没有匹配的商品，建议换一个关键词或调用 list_categories 看分类");
+            }
+            out.set("ShopSpecList", filtered);
+            log.debug("search_tea 关键词[{}]：扫描 {} 条，命中 {} 条", keyword, scanned, filtered.size());
+            return mapper.writeValueAsString(out);
+        } catch (Exception e) {
+            log.warn("search_tea 过滤失败，退回原始结果: {}", e.getMessage());
+            return raw;
+        }
     }
 
     // ==================== JSON Schema 构造辅助 ====================
