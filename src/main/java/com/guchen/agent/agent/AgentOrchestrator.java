@@ -218,11 +218,20 @@ public class AgentOrchestrator {
     private List<String> routeIntent(String input) {
         String q = input.toLowerCase();
 
-        if (containsAny(q, "下单", "购买", "买", "结算", "order"))
-            return List.of("search_tea", "get_tea_detail", "list_addresses", "view_cart",
-                    "prepare_order", "confirm_order", "cancel_order");
+        // 顺序即优先级，务必谨慎：
+        // 「下单」分支含单字「买」，若排在「购物车」之前，会把「买X加入购物车」
+        // 这类句子抢走，导致候选工具里没有 add_to_cart，模型只能答「没有加购功能」。
+        // 因此把更具体的「购物车/加购」放在前面；「买」只作为下单兜底（见分支注释）。
         if (containsAny(q, "购物车", "加购", "cart"))
             return List.of("view_cart", "add_to_cart", "remove_from_cart", "search_tea", "get_tea_detail");
+        if (containsAny(q, "下单", "购买", "结算", "order"))
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "view_cart",
+                    "prepare_order", "confirm_order", "cancel_order");
+        // 单字「买」放最后：它太宽泛（「买2份」/「想买」都会命中），
+        // 只在没有更具体意图时才走下单流程。
+        if (containsAny(q, "买"))
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "view_cart",
+                    "prepare_order", "confirm_order", "cancel_order");
         if (containsAny(q, "订单", "history", "买的"))
             return List.of("list_orders");
         if (containsAny(q, "优惠券", "券", "兑换", "coupon"))
@@ -235,7 +244,11 @@ public class AgentOrchestrator {
             return List.of("list_shop_products");
         if (containsAny(q, "主题", "系列", "theme"))
             return List.of("list_themes");
-        if (containsAny(q, "确认", "好的", "可以", "同意", "没错"))
+        // 用户确认下单。注意：不能用「可以」「好的」这类泛词——
+        // 「可以推荐几款绿茶吗」会被误判为确认，从而放行 prepare/confirm 写操作工具
+        // （实测 prompt 从 1737 涨到 3037 tokens，且模型可能直接拟单）。
+        // 「确认」「同意」保留：它们是用户批准订单草稿的唯一途径，且语境相对明确。
+        if (containsAny(q, "确认", "同意", "就这个", "就它了", "下单吧", "确认购买"))
             return List.of("confirm_order", "cancel_order", "prepare_order", "search_tea", "get_tea_detail");
 
         // 兜底：只读工具
