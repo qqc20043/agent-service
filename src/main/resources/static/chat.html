@@ -105,6 +105,11 @@ function queueSend(text) {
 }
 
 async function checkStatus() {
+  // file:// 直开时相对路径 API 全部失效，直接给出正确访问方式
+  if (location.protocol === 'file:') {
+    document.getElementById('badges').innerHTML = '<span class="badge" style="color:#e8a06a;border-color:#e8a06a">⚠ 请通过 http://127.0.0.1:8081/chat.html 访问（当前是 file:// 直开，接口不可用）</span>';
+    return;
+  }
   try {
     const r = await fetch('/actuator/health');
     const j = await r.json();
