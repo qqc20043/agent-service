@@ -173,12 +173,14 @@ public class TradeToolService {
             // 且下单链路（主单+明细）并不依赖购物车，加购是画蛇添足的一步，移除后整类故障消失。
 
             // 1) 主单（orderNo 由我们生成——老项目不生成且该列无默认值；usedPoints 必传 0，否则 NPE）
+            // 状态直接置为 unship（待发货）：本演示环境未接入真实支付，
+            // 用户确认下单即视为交易成立，前端「我的订单」应显示待发货而非待付款。
             String orderNo = "ORD" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"))
                     + String.format("%04d", (int) (Math.random() * 10000));
             ObjectNode order = mapper.createObjectNode()
                     .put("orderNo", orderNo).put("addressId", draft.path("addressId").asLong())
                     .put("shopId", shopId).put("shopName", shopName)
-                    .put("status", "unpaid")
+                    .put("status", "unship")
                     .put("totalAmount", subtotal).put("discountAmount", 0.0)
                     .put("pointsDiscount", 0.0).put("couponDiscount", 0.0)
                     .put("deliveryFee", 0.0).put("payAmount", subtotal)
@@ -204,8 +206,8 @@ public class TradeToolService {
             ObjectNode out = mapper.createObjectNode();
             out.put("action", "ORDER_CREATED")
                     .put("orderNo", orderNo).put("orderId", orderId)
-                    .put("payAmount", subtotal).put("status", "unpaid")
-                    .put("note", "订单已创建，状态为待支付（演示环境未接入真实支付）");
+                    .put("payAmount", subtotal).put("status", "unship")
+                    .put("note", "订单已创建，状态为待发货（演示环境未接入真实支付，确认即视为交易成立）");
             return json(out);
         } catch (Exception e) {
             log.warn("确认流下单失败: {}", e.getMessage(), e);
