@@ -1,5 +1,6 @@
 package com.guchen.agent.agent;
 
+import com.guchen.agent.rag.HybridRetriever;
 import lombok.extern.slf4j.Slf4j;
 import org.bsc.langgraph4j.CompiledGraph;
 import org.bsc.langgraph4j.StateGraph;
@@ -9,6 +10,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -69,7 +71,7 @@ public class AgentGraphConfig {
     public static final String NODE_RECOMMEND = "generate_recommendation";
 
     @Bean
-    public CompiledGraph<AgentState> teaRecommendationGraph() throws Exception {
+    public CompiledGraph<AgentState> teaRecommendationGraph(HybridRetriever hybridRetriever) throws Exception {
 
         StateGraph<AgentState> graph = new StateGraph<>(AgentState::new);
 
@@ -82,13 +84,17 @@ public class AgentGraphConfig {
             return out;
         }));
 
-        // ---------- 节点 2：检索茶知识（可并行分支 B） ----------
+        // ---------- 节点 2：检索茶知识（可并行分支 B）----------
+        // 2026-10-07 接通真实 HybridRetriever（BM25 + 向量 + RRF），替换原 retrieveStub 桩
         graph.addNode(NODE_RETRIEVE, node_async(state -> {
             String query = (String) state.value("query").orElse("");
             log.debug("[graph] 检索知识: {}", query);
+            List<HybridRetriever.RetrievedChunk> hits = hybridRetriever.retrieve(query, 5);
             Map<String, Object> out = new HashMap<>();
-            // 真实项目里这里调 HybridRetriever（BM25 + 向量 + RRF + Rerank）
-            out.put("knowledge_hits", retrieveStub(query));
+            out.put("knowledge_hits", hits.size());
+            out.put("knowledge_context",
+                    hits.stream().map(HybridRetriever.RetrievedChunk::content)
+                            .collect(java.util.stream.Collectors.joining("\n")));
             out.put("round", state.value("round").orElse(1));
             return out;
         }));
@@ -106,9 +112,15 @@ public class AgentGraphConfig {
         graph.addNode(NODE_EXPAND, node_async(state -> {
             int round = (Integer) state.value("round").orElse(1);
             log.debug("[graph] 命中不足，扩大检索范围，第 {} 轮", round + 1);
+            String query = (String) state.value("query").orElse("");
+            // 扩大检索 = 提高召回上限（topK 5 → 8）
+            List<HybridRetriever.RetrievedChunk> hits = hybridRetriever.retrieve(query, 8);
             Map<String, Object> out = new HashMap<>();
             out.put("round", round + 1);
-            out.put("knowledge_hits", retrieveStub("expanded"));
+            out.put("knowledge_hits", hits.size());
+            out.put("knowledge_context",
+                    hits.stream().map(HybridRetriever.RetrievedChunk::content)
+                            .collect(java.util.stream.Collectors.joining("\n")));
             return out;
         }));
 
@@ -155,11 +167,7 @@ public class AgentGraphConfig {
     }
 
     /**
-     * 检索桩：真实实现见 HybridRetriever。
-     * 这里返回命中数量，供条件边判断。
+     * （原检索桩已移除：2026-10-07 接入真实 HybridRetriever，
+     *  节点 2/4 现在执行真实的 BM25 + 向量混合检索——历史桩数字作废。）
      */
-    private int retrieveStub(String query) {
-        // TODO 接入 HybridRetriever：BM25(MySQL FULLTEXT) + 向量(Qdrant) → RRF → Rerank
-        return "expanded".equals(query) ? 5 : 2;
-    }
 }

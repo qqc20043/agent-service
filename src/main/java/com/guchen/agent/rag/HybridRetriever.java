@@ -27,6 +27,7 @@ public class HybridRetriever {
 
     private final JdbcTemplate jdbcTemplate;
     private final List<VectorStore> vectorStores;
+    private final EmbeddingService embeddingService;
 
     @Value("${rag.rrf-k:60}")
     private int rrfK;
@@ -37,9 +38,11 @@ public class HybridRetriever {
     @Value("${rag.top-k-final:5}")
     private int topKFinal;
 
-    public HybridRetriever(JdbcTemplate jdbcTemplate, List<VectorStore> vectorStores) {
+    public HybridRetriever(JdbcTemplate jdbcTemplate, List<VectorStore> vectorStores,
+                           EmbeddingService embeddingService) {
         this.jdbcTemplate = jdbcTemplate;
         this.vectorStores = vectorStores;
+        this.embeddingService = embeddingService;
     }
 
     /** 检索并组装成给 LLM 的上下文文本（带引用编号）。 */
@@ -119,6 +122,8 @@ public class HybridRetriever {
 
     /**
      * 向量召回。多向量库时取并集，方便做 Qdrant vs Milvus 的对比实验。
+     * Qdrant 点 id 是 UUID（数字 id 不被 Qdrant 接受），真实 chunk id 存在 payload 的
+     * chunk_id 字段——此处统一翻译回 chunk id，保证与 BM25 腿在同一 ID 空间做 RRF 融合。
      */
     private List<String> vectorSearch(String query, int limit) {
         float[] qv = embed(query);
@@ -127,7 +132,8 @@ public class HybridRetriever {
         LinkedHashSet<String> ids = new LinkedHashSet<>();
         for (VectorStore store : vectorStores) {
             try {
-                store.search(qv, limit, Map.of()).forEach(h -> ids.add(h.id()));
+                store.search(qv, limit, Map.of()).forEach(h ->
+                        ids.add(String.valueOf(h.payload().getOrDefault("chunk_id", h.id()))));
             } catch (Exception e) {
                 log.warn("向量库 {} 检索失败: {}", store.backend(), e.getMessage());
             }
@@ -194,12 +200,11 @@ public class HybridRetriever {
     }
 
     /**
-     * 文本向量化。生产接 BGE-M3 / text-embedding-3 等 embedding 服务。
+     * 文本向量化：调硅基流动 BAAI/bge-m3（2026-10-07 接通）。
      * 返回 null 表示 embedding 不可用，此时降级为纯 BM25。
      */
     private float[] embed(String text) {
-        // TODO 接入 embedding 服务
-        return null;
+        return embeddingService.embedOne(text);
     }
 
     public record RetrievedChunk(String id, String content, double score) {}
