@@ -40,6 +40,12 @@ public class EmbeddingService {
                 .baseUrl(baseUrl)
                 .defaultHeader("Authorization", "Bearer " + apiKey)
                 .defaultHeader("Content-Type", MediaType.APPLICATION_JSON_VALUE)
+                // 关键：WebClient 默认内存缓冲仅 256KB。批量向量化时，
+                // 16 条 × 1024 维浮点数的 JSON 响应可达数百 KB，超限会抛
+                // DataBufferLimitException，而异常信息被包装成
+                // "200 OK from POST ..." —— 看起来像 API 失败，实际是本地缓冲不够。
+                // （LlmClient 早已设 16MB，此处当初漏了）
+                .codecs(c -> c.defaultCodecs().maxInMemorySize(32 * 1024 * 1024))
                 .build();
     }
 
@@ -81,7 +87,9 @@ public class EmbeddingService {
             }
             return out;
         } catch (Exception e) {
-            log.warn("embedding 调用失败（降级为纯 BM25）: {}", e.getMessage());
+            // 打异常类名：曾因只打 message 而把 DataBufferLimitException 误读成「API 200 却失败」
+            log.warn("embedding 调用失败（降级为纯 BM25）: {} - {}",
+                    e.getClass().getSimpleName(), e.getMessage());
             return List.of();
         }
     }
