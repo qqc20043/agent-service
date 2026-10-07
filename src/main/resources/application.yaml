@@ -83,7 +83,7 @@ llm:
 # ---------- Agent 运行参数（Nacos 动态改，不重启） ----------
 agent:
   max-iterations: 6
-  max-tool-calls-per-turn: 5
+  max-tool-calls-per-turn: 8
   tool-timeout-ms: 3000
   memory:
     max-turns: 10

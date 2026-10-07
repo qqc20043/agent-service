@@ -168,13 +168,11 @@ public class TradeToolService {
         String shopName = draft.path("shopName").asText();
 
         try {
-            // 1) 加购（老项目下单契约从购物车语义出发；加购幂等：同商品同规格更新数量）
-            ObjectNode cartItem = mapper.createObjectNode()
-                    .put("productId", productId).put("specId", specId)
-                    .put("quantity", quantity).put("checked", 1);
-            tearSpring.addToCart(cartItem);
+            // 注意：不下加购这一步。老项目 cart_item 的唯一键 uk_cart_product 是
+            // (cart_id, product_id)——不含 spec_id，同商品换规格加购会撞唯一键 500（缺陷 #5）；
+            // 且下单链路（主单+明细）并不依赖购物车，加购是画蛇添足的一步，移除后整类故障消失。
 
-            // 2) 主单（orderNo 由我们生成——老项目不生成且该列无默认值；usedPoints 必传 0，否则 NPE）
+            // 1) 主单（orderNo 由我们生成——老项目不生成且该列无默认值；usedPoints 必传 0，否则 NPE）
             String orderNo = "ORD" + LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd"))
                     + String.format("%04d", (int) (Math.random() * 10000));
             ObjectNode order = mapper.createObjectNode()

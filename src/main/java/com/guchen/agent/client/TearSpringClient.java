@@ -98,6 +98,10 @@ public interface TearSpringClient {
     @GetMapping("/user/addressI")
     String addressList();
 
+    /** 新增/更新收货地址（老项目按 id 是否存在自动区分插入与更新） */
+    @PostMapping("/user/addressUpdateInsert")
+    String addressUpsert(@RequestBody com.fasterxml.jackson.databind.JsonNode body);
+
     @GetMapping("/user/noteI")
     String noteList();
 

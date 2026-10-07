@@ -50,7 +50,8 @@ public class ToolRegistry {
         // ---------- 只读工具 ----------
         // 老项目 /product/shopSpecList 无关键词参数、恒返回全量商品（实测 48 条 / 约 3000 prompt tokens），
         // 因此在这里做 agent 侧关键词过滤，最多返回 10 条——修掉「假搜索」并压 token 成本
-        register("search_tea", "按关键词搜索茶叶商品，返回匹配的商品列表（最多 10 条）",
+        register("search_tea", "按关键词搜索茶叶商品，返回匹配的商品列表（最多 10 条）。"
+                + "列表只显示默认规格；用户要的规格不在列表里时，用 get_tea_detail 查看该商品的全部规格再回答",
                 params(Map.of("keyword", "string"), List.of("keyword")), false,
                 args -> searchTea(args.path("keyword").asText()));
 
@@ -99,6 +100,13 @@ public class ToolRegistry {
         register("list_addresses", "查询当前用户收货地址列表",
                 emptyParams(), false,
                 args -> tearSpring.addressList());
+
+        register("add_address", "新增收货地址（写操作）。用户在对话里直接报收货人/电话/地址时调用，"
+                        + "替用户代填；省市区从用户描述里拆分，详细门牌放 detail",
+                params(Map.of("name", "string", "phone", "string", "province", "string",
+                                "city", "string", "district", "string", "detail", "string", "tag", "string"),
+                        List.of("name", "phone", "province", "city", "district", "detail")), true,
+                args -> addAddress(args));
 
         register("list_coupons", "查询当前用户已领取的优惠券",
                 emptyParams(), false,
@@ -290,6 +298,14 @@ public class ToolRegistry {
         }
     }
 
+    private String json(ObjectNode node) {
+        try {
+            return mapper.writeValueAsString(node);
+        } catch (Exception e) {
+            return "{\"error\":\"序列化失败\"}";
+        }
+    }
+
     /** 在全量商品列表里定位商品（校验 id 真实性用）；找不到返回 null。 */
     private JsonNode findProductInList(long productId) {
         try {
@@ -300,6 +316,60 @@ public class ToolRegistry {
         } catch (Exception ignored) {
         }
         return null;
+    }
+
+    // ==================== 收货地址代填 ====================
+
+    /**
+     * 新增收货地址。老项目 addressUpdateInsert 按 id 是否存在自动区分插入/更新，
+     * userId 从 token 取（不信任传参）；新地址置为默认，旧默认自动让位（service 内已处理）。
+     * 省市区编码列是自由文本，对话场景填空串即可（App 内手动添加才带编码）。
+     */
+    private String addAddress(JsonNode args) {
+        String name = args.path("name").asText("").trim();
+        String phone = args.path("phone").asText("").trim();
+        String province = args.path("province").asText("").trim();
+        String city = args.path("city").asText("").trim();
+        String district = args.path("district").asText("").trim();
+        String detail = args.path("detail").asText("").trim();
+        String tag = args.path("tag").asText("").trim();
+
+        if (name.isEmpty()) return err("收货人姓名必填");
+        String digits = phone.replaceAll("\\D", "");
+        if (digits.length() < 5 || digits.length() > 15) return err("电话格式不正确: " + phone);
+        if (detail.isEmpty()) return err("详细地址（街道/门牌）必填");
+        if (province.isEmpty() && city.isEmpty() && district.isEmpty()) {
+            return err("省/市/区至少提供一项（从用户描述里拆分，如「江西省」「南昌市」「南昌大学」）");
+        }
+
+        // 去重：同电话同 fullAddress 已存在时直接复用，不再插入（防对话重试产生重复地址）
+        try {
+            JsonNode arr = mapper.readTree(tearSpring.addressList()).path("addressList");
+            for (JsonNode a : arr) {
+                if (a.path("phone").asText("").equals(digits.length() == 11 ? digits : phone)
+                        && a.path("fullAddress").asText("").equals(province + city + district + detail)) {
+                    ObjectNode dup = mapper.createObjectNode();
+                    dup.put("action", "EXISTS");
+                    dup.put("addressId", a.path("id").asLong());
+                    dup.put("fullAddress", a.path("fullAddress").asText());
+                    dup.put("note", "该地址已存在，直接复用，未重复创建");
+                    return json(dup);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        ObjectNode body = mapper.createObjectNode()
+                .put("name", name)
+                .put("phone", digits.length() == 11 ? digits : phone)
+                .put("tag", tag.isEmpty() ? "家" : tag)
+                .put("province", province).put("provinceCode", "")
+                .put("city", city).put("cityCode", "")
+                .put("district", district).put("districtCode", "")
+                .put("detail", detail)
+                .put("fullAddress", province + city + district + detail)
+                .put("isDefault", 1);
+        return tearSpring.addressUpsert(body);
     }
 
     // ==================== JSON Schema 构造辅助 ====================

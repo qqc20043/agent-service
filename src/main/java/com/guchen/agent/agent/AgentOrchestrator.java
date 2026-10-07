@@ -55,6 +55,13 @@ public class AgentOrchestrator {
     @Value("${agent.max-tool-calls-per-turn:5}")
     private int maxToolCallsPerTurn;
 
+    /**
+     * 确认/取消协议句式（不经 LLM 的直通消息）：
+     * 「确认下单，令牌 <32位hex>」「取消订单，令牌 <32位hex>」
+     */
+    private static final java.util.regex.Pattern CONFIRM_MSG_PATTERN =
+            java.util.regex.Pattern.compile("(?:确认下单|取消订单)[，,]?\s*令牌\s*([a-f0-9]{16,64})");
+
     private static final String SYSTEM_PROMPT = """
             你是「漫思茶」电商平台的智能茶饮顾问，负责帮用户找茶、问茶、下单。
 
@@ -67,6 +74,9 @@ public class AgentOrchestrator {
             6. 下单必须走确认流：先调用 prepare_order 拟单，把拟单内容（商品/规格/数量/合计/收货地址）
                完整复述给用户，等用户明确回复同意后才调用 confirm_order。用户未确认绝不 confirm；
                金额与商品信息一律以工具返回为准，禁止自行计算或编造价格。
+               用户回复「确认」并附令牌时，只调用 confirm_order(该令牌)，绝不重新拟单或执行其他工具。
+            7. 用户在对话里直接报收货人/电话/地址时（如「收货人 qq，电话 182...，地址南昌大学」），
+               调用 add_address 替用户代填，然后把新地址用于拟单，不要让用户去 App 里手动添加。
             """;
 
     /**
@@ -100,6 +110,29 @@ public class AgentOrchestrator {
             String memoryScope = (userId != null) ? ("u" + userId) : ("s" + sessionId);
             String profileLine = (userId != null) ? userProfile.profileContext(token, userId) : "";
             log.debug("[{}] 记忆域: {} (userId={})", traceId, memoryScope, userId);
+
+            // ---------- 确认/取消协议直通（不经 LLM） ----------
+            // 「确认下单，令牌 X」/「取消订单，令牌 X」是刚性协议步骤：执行结果完全确定，
+            // 走 LLM 会出现「重新研究一遍再拟单」的循环（实测踩中），且白耗 token。
+            java.util.regex.Matcher cm = CONFIRM_MSG_PATTERN.matcher(userInput == null ? "" : userInput.trim());
+            if (cm.find()) {
+                boolean cancel = userInput.contains("取消");
+                String tok = cm.group(1);
+                onToolEvent.accept(Map.of("type", "confirm_executing", "cancel", cancel));
+                String output = tools.execute(cancel ? "cancel_order" : "confirm_order",
+                        "{\"confirmToken\":\"" + tok + "\"}");
+                trace.recordToolCall(traceId, cancel ? "cancel_order" : "confirm_order",
+                        "{\"confirmToken\":\"" + tok + "\"}", 0, true);
+                for (String piece : splitForStream(output)) {
+                    onDelta.accept(piece);
+                    sleep(12);
+                }
+                memory.append(memoryScope, userInput, output);
+                onDone.accept(Map.of("traceId", traceId, "sessionId", sessionId,
+                        "toolCalls", 1, "promptTokens", 0, "completionTokens", 0,
+                        "latencyMs", (int) (System.currentTimeMillis() - start), "costYuan", 0.0));
+                return;
+            }
 
             // ---------- 1. 意图路由（确定性） ----------
             List<String> candidateTools = routeIntent(userInput);
@@ -261,19 +294,19 @@ public class AgentOrchestrator {
         if (containsAny(q, "购物车", "加购", "cart"))
             return List.of("view_cart", "add_to_cart", "remove_from_cart", "search_tea", "get_tea_detail");
         if (containsAny(q, "下单", "购买", "结算", "order"))
-            return List.of("search_tea", "get_tea_detail", "list_addresses", "view_cart",
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address", "view_cart",
                     "prepare_order", "confirm_order", "cancel_order");
         // 单字「买」放最后：它太宽泛（「买2份」/「想买」都会命中），
         // 只在没有更具体意图时才走下单流程。
         if (containsAny(q, "买"))
-            return List.of("search_tea", "get_tea_detail", "list_addresses", "view_cart",
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address", "view_cart",
                     "prepare_order", "confirm_order", "cancel_order");
         if (containsAny(q, "订单", "history", "买的"))
             return List.of("list_orders");
         if (containsAny(q, "优惠券", "券", "兑换", "coupon"))
             return List.of("list_coupons", "redeem_coupon");
         if (containsAny(q, "地址", "收货"))
-            return List.of("list_addresses");
+            return List.of("list_addresses", "add_address");
         if (containsAny(q, "分类", "有哪些种类", "品类", "category"))
             return List.of("list_categories", "list_themes");
         if (containsAny(q, "店铺", "茶铺", "shop"))

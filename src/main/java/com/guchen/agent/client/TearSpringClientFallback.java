@@ -46,6 +46,7 @@ public class TearSpringClientFallback implements FallbackFactory<TearSpringClien
             @Override public String couponUserList() { return degrade("couponUserList"); }
             @Override public String userData() { return degrade("userData"); }
             @Override public String addressList() { return degrade("addressList"); }
+            @Override public String addressUpsert(com.fasterxml.jackson.databind.JsonNode b) { return degrade("addressUpsert"); }
             @Override public String noteList() { return degrade("noteList"); }
             @Override public String momentList() { return degrade("momentList"); }
             @Override public String searchProductRaw() { return degrade("searchProduct"); }
