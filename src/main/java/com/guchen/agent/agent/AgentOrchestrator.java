@@ -100,13 +100,20 @@ public class AgentOrchestrator {
                用户回复「确认」并附令牌时，只调用 confirm_order(该令牌)，绝不重新拟单或执行其他工具。
             7. 用户在对话里直接报收货人/电话/地址时（如「收货人 qq，电话 182...，地址南昌大学」），
                调用 add_address 替用户代填，然后把新地址用于拟单，不要让用户去 App 里手动添加。
-            7.5 【下单前必须确认收货地址】准备拟单时，先确认用哪个地址：
-               - 用户在**本轮对话里刚报过**新地址 → 用 add_address 建好后直接拟单；
-               - 否则（要沿用已有地址）→ **必须先调用 request_address_pick**，
-                 前端会把地址列表渲染成卡片让用户点选；用户点选后回复形如「用地址 26」，
-                 你收到后把该 id 作为 addressId 传给 prepare_order。
-               不要凭历史记忆猜 addressId，也不要在用户没确认地址前就拟单。
-               被问到「对不对/要修改吗」时如实复述该地址的收货人、电话与完整地址。
+            7.5 【收货地址：默认直接用，不要反复询问】
+               ⚠️ 除非用户明说「换个地址」「改地址」，否则**不要**为了确认地址而中断下单流程，
+               也不要调用 request_address_pick 让用户选——直接调用 prepare_order（省略 addressId
+               即自动使用默认地址）。系统会在确认弹窗上展示收货地址，并把「点击修改」交给用户按需触发。
+               用户从地址卡片/弹层选好后会发「用地址 <id>」，届时作为 addressId 传给 prepare_order。
+            7.6 【只确认一次，禁止反复追问】
+               拟单成功后，**一次性**把关键信息说清楚即可（商品/规格/数量/金额/收货地址），
+               然后**立刻停止**，等用户点确认弹窗上的按钮。
+               ⚠️ 严禁出现「请确认规格与数量」→「请确认地址」→「请先去卡片点选」这类**多轮重复追问**：
+               - 用户没说规格时按默认规格直接拟单，不要反问；
+               - 用户没说数量时按 1 份直接拟单，不要反问；
+               - 地址一律用默认地址，不要反问。
+               只有两种情况才需要追问：① 商品没搜到或有多款需要用户挑；② 用户主动要求修改。
+               拟单后系统会自动弹出确认窗口，你**不需要**在文字里再让用户"回复确认"。
             8. 【规格判断】判断某商品「有没有某个规格」时，**必须以接口返回的规格清单为准**：
                search_tea 返回的 specs 字段、或 get_tea_detail 返回的 productSpecs。
                ⚠️ search_tea 顶层那个 `spec`/`price` 只是**默认规格的展示副本**——
@@ -231,6 +238,11 @@ public class AgentOrchestrator {
             if (pa.matches()) {
                 String aid = pa.group(1);
                 selectedAddressId = aid;
+                // 换地址会生成新草稿，先作废旧的：避免两个令牌同时有效导致用户点到过期的那个
+                String staleToken = draft.pendingToken(sessionId);
+                if (staleToken != null && !staleToken.isBlank()) {
+                    tools.execute("cancel_order", "{\"confirmToken\":\"" + staleToken + "\"}");
+                }
                 effectiveInput = "【系统指令】用户已从地址卡片选定收货地址，addressId=" + aid + "。"
                         + "请直接用该 addressId 调用 prepare_order 完成拟单（productId/specId/quantity "
                         + "沿用上一轮已确认的商品与规格），然后复述拟单内容等待用户确认。"
@@ -309,45 +321,30 @@ public class AgentOrchestrator {
 
                     long t0 = System.currentTimeMillis();
 
-                    // ===== 地址确认的确定性保障（服务端强制，不依赖模型自觉） =====
-                    // 需求：下单前必须先让用户确认收货地址（点了才知道对不对）。
-                    // 实测模型并不可靠——有时调 request_address_pick，有时直接 prepare_order 跳过地址确认。
-                    // 因此这里在拟单前做一次硬校验：本会话还没选定地址、且用户也没在本轮报新地址时，
-                    // 拦截 prepare_order，改为主动推地址卡片，让用户先点选。
-                    boolean addressGate = false;
+                    // ===== 收货地址：默认直接用，不阻断流程（对齐千问交互） =====
+                    // 设计变更（用户实测反馈「重复询问太多次」）：
+                    //   旧实现强制用户先点地址卡片才能拟单，导致「问规格→问地址→去点卡片→再确认」
+                    //   三四轮来回。而千问的做法是**默认地址直接带上**，只在回复里说一句
+                    //   「当前地址是 XXX（点击修改）」，用户觉得不对才去改。
+                    //   因此这里不再拦截 prepare_order；改为在拟单时顺带把默认地址信息推给前端，
+                    //   让确认卡片上一并展示，用户不满意可点「修改」换地址后重新拟单。
+                    String output;
                     if ("prepare_order".equals(call.name())) {
-                        boolean pickedThisTurn = pa.matches() || selectedAddressId != null;
-                        boolean gaveNewAddress = containsAny(trimmed, "收货人", "电话", "地址", "小区", "路", "号", "栋");
-                        if (!pickedThisTurn && !gaveNewAddress) {
-                            try {
-                                String addrJson = tools.execute("request_address_pick", "{}");
-                                JsonNode arr = mapper.readTree(addrJson).path("addressList");
-                                if (arr.isArray() && !arr.isEmpty()) {
-                                    ArrayNode slim = mapper.createArrayNode();
-                                    for (JsonNode a : arr) {
-                                        ObjectNode one = mapper.createObjectNode();
-                                        one.put("addressId", a.path("id").asLong());
-                                        one.put("name", a.path("name").asText());
-                                        one.put("phone", a.path("phone").asText());
-                                        one.put("tag", a.path("tag").asText());
-                                        one.put("fullAddress", a.path("fullAddress").asText());
-                                        one.put("isDefault", a.path("isDefault").asInt());
-                                        slim.add(one);
-                                    }
-                                    onToolEvent.accept(Map.of("type", "confirm_address", "addresses", slim));
-                                    addressGate = true;
-                                    log.info("[{}] 拟单前未确认地址，已拦截并推地址卡片", traceId);
-                                }
-                            } catch (Exception e) {
-                                log.warn("[{}] 地址卡片推送失败，放行拟单: {}", traceId, e.getMessage());
+                        output = tools.execute(call.name(), call.arguments());
+                        try {
+                            JsonNode out = mapper.readTree(output);
+                            if (out.hasNonNull("confirmToken") && !out.hasNonNull("error")) {
+                                JsonNode d = out.path("draft");
+                                onToolEvent.accept(Map.of(
+                                        "type", "address_line",
+                                        "addressId", d.path("addressId").asLong(),
+                                        "addressSummary", d.path("addressSummary").asText()));
                             }
+                        } catch (Exception ignored) {
                         }
+                    } else {
+                        output = tools.execute(call.name(), call.arguments());
                     }
-
-                    String output = addressGate
-                            ? "{\"error\":\"请先确认收货地址：已向前端推送地址卡片，等用户选定后"
-                              + "会以「用地址 <id>」回复，届时再带 addressId 调用 prepare_order。\"}"
-                            : tools.execute(call.name(), call.arguments());
                     int latency = (int) (System.currentTimeMillis() - t0);
 
                     // 幂等与可观测：写操作单独落表
@@ -376,13 +373,27 @@ public class AgentOrchestrator {
                             JsonNode out = mapper.readTree(output);
                             if (out.hasNonNull("confirmToken") && !out.hasNonNull("error")) {
                                 String tk = out.path("confirmToken").asText();
+                                JsonNode d = out.path("draft");
                                 // 记录本会话有待确认草稿，供「裸确认」兜底识别
                                 draft.markPending(sessionId, tk);
-                                onToolEvent.accept(Map.of(
-                                        "type", "confirm_ready",
-                                        "confirmToken", tk,
-                                        "confirmPhrase", "确认下单，令牌 " + tk,
-                                        "summary", draftSummary(out.path("draft"))));
+                                // 一次推全：弹窗需要商品/规格/数量/单价/合计/**收货地址**，
+                                // 全部塞进结构化字段，前端才能只弹一次、用户只确认一次。
+                                ObjectNode payload = mapper.createObjectNode();
+                                payload.put("type", "confirm_ready");
+                                payload.put("confirmToken", tk);
+                                payload.put("confirmPhrase", "确认下单，令牌 " + tk);
+                                payload.put("summary", draftSummary(d));
+                                payload.put("productName", d.path("productName").asText());
+                                payload.put("productEmoji", d.path("productEmoji").asText());
+                                payload.put("specName", d.path("specName").asText());
+                                payload.put("quantity", d.path("quantity").asInt());
+                                payload.put("unitPrice", d.path("unitPrice").asDouble());
+                                payload.put("subtotal", d.path("subtotal").asDouble());
+                                payload.put("shopName", d.path("shopName").asText());
+                                payload.put("addressId", d.path("addressId").asLong());
+                                payload.put("addressSummary", d.path("addressSummary").asText());
+                                onToolEvent.accept(
+                                        mapper.convertValue(payload, new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}));
                             } else if (out.hasNonNull("error")) {
                                 log.warn("[{}] prepare_order 被拒: {}", traceId, out.path("error").asText());
                             }
@@ -508,15 +519,23 @@ public class AgentOrchestrator {
         if (containsAny(q, "购物车", "加购", "cart"))
             return List.of("view_cart", "add_to_cart", "remove_from_cart", "search_tea", "get_tea_detail");
         if (containsAny(q, "下单", "购买", "结算", "order"))
-            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address",
-                    "request_address_pick", "view_cart",
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address", "view_cart",
+                    "prepare_order", "confirm_order", "cancel_order");
+        // 自然下单表达：「我要X」「来一份X」「要一份」等。
+        // ⚠️ 必须用双字以上组合：单字「要」太泛（「要多少钱」「要多久」都会被误判成下单），
+        // 这是 §〇.六 B2「禁用单字/泛词关键词」教训的直接应用。
+        if (containsAny(q, "我要", "来一", "来份", "要一份", "要一个", "给我来", "帮我买", "来点", "要买"))
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address", "view_cart",
                     "prepare_order", "confirm_order", "cancel_order");
         // 单字「买」放最后：它太宽泛（「买2份」/「想买」都会命中），
         // 只在没有更具体意图时才走下单流程。
         if (containsAny(q, "买"))
-            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address",
-                    "request_address_pick", "view_cart",
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address", "view_cart",
                     "prepare_order", "confirm_order", "cancel_order");
+        // 换/改地址：用户明确要求修改时才给这个工具（下单分支刻意不含它，
+        // 避免模型主动"确认地址"导致反复追问）
+        if (containsAny(q, "换地址", "改地址", "修改地址", "换个地址", "换收货", "改收货"))
+            return List.of("request_address_pick", "add_address", "list_addresses");
         if (containsAny(q, "订单", "history", "买的"))
             return List.of("list_orders");
         if (containsAny(q, "优惠券", "券", "兑换", "coupon"))
