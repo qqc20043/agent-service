@@ -51,11 +51,15 @@ public class ToolRegistry {
         // 老项目 /product/shopSpecList 无关键词参数、恒返回全量商品（实测 48 条 / 约 3000 prompt tokens），
         // 因此在这里做 agent 侧关键词过滤，最多返回 10 条——修掉「假搜索」并压 token 成本
         register("search_tea", "按关键词搜索茶叶商品，返回匹配的商品列表（最多 10 条）。"
-                + "列表只显示默认规格；用户要的规格不在列表里时，用 get_tea_detail 查看该商品的全部规格再回答",
+                + "每条商品的 specs 字段列出它**全部可用规格**（specId/specName/price/stock）；"
+                + "顶层 spec/price 只是默认规格的展示副本。判断某规格是否存在必须以 specs 为准——"
+                + "默认规格是别的装量，不代表其他规格不存在，禁止据此回绝用户。"
+                + "命中数较多时可能未附 specs，此时用 get_tea_detail 查看该商品的全部规格。",
                 params(Map.of("keyword", "string"), List.of("keyword")), false,
                 args -> searchTea(args.path("keyword").asText()));
 
-        register("get_tea_detail", "获取单个茶叶商品的详细信息与规格。"
+        register("get_tea_detail", "获取单个茶叶商品的详细信息与完整规格清单（productSpecs，含 specId/specName/price/stock）。"
+                        + "判断某规格是否存在时以本接口的 productSpecs 为准。"
                         + "productId 必须来自 search_tea 的真实结果，禁止编造或凭记忆推测",
                 params(Map.of("productId", "integer"), List.of("productId")), false,
                 args -> getTeaDetail(args.path("productId").asLong()));
@@ -185,11 +189,18 @@ public class ToolRegistry {
             return result;
         } catch (Exception e) {
             log.warn("工具 {} 执行失败: {}", name, e.getMessage());
-            String msg = String.valueOf(e.getMessage()).replace("\"", "'");
+            String msg = String.valueOf(e.getMessage())
+                    .replace("\\", "/").replace("\"", "'").replace("\n", " ").replace("\r", " ");
             // Feign fallbackFactory 在未启用 circuit breaker 时不生效（本项目即此配置），
-            // 401 等异常会直接抛到这里——在此打鉴权标记供编排器短路
-            boolean authFailed = msg.contains("[401]") || msg.contains("401 Unauthorized");
-            return "{\"error\":\"" + msg + "\",\"authFailed\":" + authFailed + "}";
+            // 401 等异常会直接抛到这里——在此打鉴权标记供编排器短路。
+            // ⚠️ 匹配必须带上下文（"[401]" / "401 Unauthorized"），
+            // 裸 "401" 会误伤业务数据（实测地址 districtCode=340102 含 401 子串）。
+            boolean authFailed = msg.contains("[401]") || msg.contains("401 Unauthorized")
+                    || msg.contains("401 unauthorized");
+            ObjectNode errNode = mapper.createObjectNode();
+            errNode.put("error", msg);
+            errNode.put("authFailed", authFailed);
+            return json(errNode);
         }
     }
 
@@ -252,9 +263,31 @@ public class ToolRegistry {
     private static final int SEARCH_MAX_RESULTS = 10;
 
     /**
+     * 规格列表的补全上限：命中数不超过这个值时，逐个回查真实规格并挂到结果上。
+     *
+     * 为什么需要补全（真实缺陷修复）：
+     *  老项目 /product/shopSpecList 每条商品只带**默认规格的扁平字段**（`spec`/`price`/`stock`），
+     *  既没有 specId、也没有其他规格。LLM 拿到这份数据后会得出「该商品只有这一个规格」的结论，
+     *  进而**否定用户已经明确提出的、实际存在的其他规格**（实测：用户要「武功山云雾·品鉴装50g」，
+     *  spec_id=9 真实存在（¥98/库存30），但模型因搜索结果只显示「标准装100g」而回复
+     *  「并无品鉴装50g，我无法按此下单」——把用户卡死在死循环里）。
+     *  补全后模型手里有完整规格，此类误判从源头消失。
+     */
+    private static final int SPEC_ENRICH_MAX = 5;
+
+    /** 规格缓存：productId → 规格数组 JSON。TTL 5 分钟，避免同一次会话反复回查老项目。 */
+    private final Map<Long, CachedSpecs> specCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long SPEC_CACHE_MS = 5 * 60 * 1000L;
+
+    private record CachedSpecs(JsonNode specs, long at) {}
+
+    /**
      * 拉全量商品后按关键词过滤（匹配整条 JSON 文本，对字段命名不敏感），
      * 返回结构与原始 ShopSpecList 一致并附 matched/totalScanned 供 LLM 判断。
      * 空关键词返回封顶的全量列表。
+     *
+     * 额外：命中数较少时，为每条商品补上**完整规格列表**（specs: [{specId, specName, price, stock, isDefault}]），
+     * 让 LLM 不必（也不应）依赖默认规格去推断「有没有其他规格」。
      */
     private String searchTea(String keyword) {
         String raw = tearSpring.searchProductRaw();
@@ -273,21 +306,89 @@ public class ToolRegistry {
                 }
             }
 
+            // 规格补全：只在命中数少时做（搜索场景通常精准），避免命中 10 条时打 10 次老项目接口
+            boolean enriched = false;
+            if (filtered.size() > 0 && filtered.size() <= SPEC_ENRICH_MAX) {
+                for (int i = 0; i < filtered.size(); i++) {
+                    JsonNode item = filtered.get(i);
+                    ObjectNode patched = attachSpecs(item);
+                    if (patched != null) {
+                        filtered.set(i, patched);
+                        enriched = true;
+                    }
+                }
+            }
+
             ObjectNode out = mapper.createObjectNode();
             out.put("msg", kw.isEmpty() ? "返回全部商品（已截断）" : "按关键词「" + keyword + "」过滤商品");
             out.put("code", 200);
             out.put("matched", filtered.size());
             out.put("totalScanned", scanned);
+            if (enriched) {
+                out.put("specsNote", "本次已在每条商品的 specs 字段附带该商品**全部可用规格**"
+                        + "（specId/specName/price/stock/isDefault）。"
+                        + "顶层 spec/price 仅为默认规格的展示副本；"
+                        + "判断「有没有某个规格」必须以 specs 为准，禁止因为默认规格不同就断定规格不存在。");
+            }
             if (filtered.isEmpty()) {
                 out.put("hint", "没有匹配的商品，建议换一个关键词或调用 list_categories 看分类");
             }
             out.set("ShopSpecList", filtered);
-            log.debug("search_tea 关键词[{}]：扫描 {} 条，命中 {} 条", keyword, scanned, filtered.size());
+            log.debug("search_tea 关键词[{}]：扫描 {} 条，命中 {} 条，规格补全={}",
+                    keyword, scanned, filtered.size(), enriched);
             return mapper.writeValueAsString(out);
         } catch (Exception e) {
             log.warn("search_tea 过滤失败，退回原始结果: {}", e.getMessage());
             return raw;
         }
+    }
+
+    /**
+     * 给一条商品补上完整规格。失败时返回 null（保持原样，不影响搜索主流程）。
+     * 走 5 分钟缓存，避免同一商品反复回查老项目。
+     */
+    private ObjectNode attachSpecs(JsonNode item) {
+        long pid = item.path("id").asLong(0);
+        if (pid <= 0 || !item.isObject()) return null;
+        try {
+            JsonNode specs = loadSpecs(pid);
+            if (specs == null || !specs.isArray() || specs.isEmpty()) return null;
+
+            ObjectNode copy = ((ObjectNode) item).deepCopy();
+            ArrayNode slim = mapper.createArrayNode();
+            for (JsonNode s : specs) {
+                ObjectNode one = mapper.createObjectNode();
+                one.put("specId", s.path("id").asLong());
+                one.put("specName", s.path("specName").asText());
+                one.put("price", s.path("price").asDouble());
+                one.put("stock", s.path("stock").asInt());
+                one.put("isDefault", s.path("isDefault").asInt());
+                slim.add(one);
+            }
+            copy.set("specs", slim);
+            return copy;
+        } catch (Exception e) {
+            log.debug("商品 {} 规格补全失败（保留默认展示）: {}", pid, e.getMessage());
+            return null;
+        }
+    }
+
+    /** 读商品规格（带缓存）：productId → productSpecs 数组。失败返回 null（调用方降级）。 */
+    private JsonNode loadSpecs(long productId) {
+        CachedSpecs cached = specCache.get(productId);
+        long now = System.currentTimeMillis();
+        if (cached != null && now - cached.at() < SPEC_CACHE_MS) return cached.specs();
+
+        JsonNode specs;
+        try {
+            specs = mapper.readTree(
+                    tearSpring.productDetail(Map.of("id", (int) productId))).path("productSpecs");
+        } catch (Exception e) {
+            log.debug("读取商品 {} 规格失败: {}", productId, e.getMessage());
+            return null;
+        }
+        specCache.put(productId, new CachedSpecs(specs, now));
+        return specs;
     }
 
     private String err(String msg) {

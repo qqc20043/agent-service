@@ -48,6 +48,7 @@ public class AgentOrchestrator {
     private final ObjectMapper mapper;
     private final com.guchen.agent.memory.UserContextService userContext;
     private final com.guchen.agent.memory.UserProfileService userProfile;
+    private final com.guchen.agent.tool.TradeToolService draft;
 
     @Value("${agent.max-iterations:6}")
     private int maxIterations;
@@ -61,6 +62,20 @@ public class AgentOrchestrator {
      */
     private static final java.util.regex.Pattern CONFIRM_MSG_PATTERN =
             java.util.regex.Pattern.compile("(?:确认下单|取消订单)[，,]?\s*令牌\s*([a-f0-9]{16,64})");
+
+    /**
+     * 裸确认/裸取消：用户只说「确认」「确认吧」「取消」这类词，没带令牌。
+     * 这类输入不能交给 LLM——它手上没有令牌，只会「重新研究一遍」，
+     * 而重新研究用的搜索数据不完整，反过来会否定用户已经选对的东西
+     * （实测：用户选「武功山云雾·品鉴装50g」（真实存在，spec_id=9，¥98），
+     *  模型复核后回复「并无品鉴装50g，我无法按此下单」，连卡三次）。
+     * 这里做确定性兜底：有草稿就引导带令牌确认，没草稿就直说没有待确认订单。
+     */
+    private static final java.util.regex.Pattern BARE_CONFIRM_PATTERN =
+            java.util.regex.Pattern.compile("^\s*(确认|确定|同意|就这个|就它了|下单吧|确认购买|好的?|可以|嗯)\s*[吧呢啊。！!，,~～]*\s*$");
+
+    private static final java.util.regex.Pattern BARE_CANCEL_PATTERN =
+            java.util.regex.Pattern.compile("^\s*(取消|不要了|算了|不买了|撤销)\s*[吧呢啊。！!，,~～]*\s*$");
 
     private static final String SYSTEM_PROMPT = """
             你是「漫思茶」电商平台的智能茶饮顾问，负责帮用户找茶、问茶、下单。
@@ -77,6 +92,20 @@ public class AgentOrchestrator {
                用户回复「确认」并附令牌时，只调用 confirm_order(该令牌)，绝不重新拟单或执行其他工具。
             7. 用户在对话里直接报收货人/电话/地址时（如「收货人 qq，电话 182...，地址南昌大学」），
                调用 add_address 替用户代填，然后把新地址用于拟单，不要让用户去 App 里手动添加。
+            8. 【规格判断】判断某商品「有没有某个规格」时，**必须以接口返回的规格清单为准**：
+               search_tea 返回的 specs 字段、或 get_tea_detail 返回的 productSpecs。
+               ⚠️ search_tea 顶层那个 `spec`/`price` 只是**默认规格的展示副本**——
+               默认是「标准装 100g」绝不代表该商品只有这一个规格，其他装量很可能同样存在。
+               **绝对禁止**因为默认规格与用户所说不同，就断言「没有这个规格 / 我无法下单」。
+               拿不准时先调 get_tea_detail 看完整规格清单，或向用户确认，而不是替用户下结论。
+            9. 【不得推翻用户的正确选择】用户已经明确说出商品与规格、且该规格在接口数据里真实存在时，
+               直接按它拟单。禁止自作主张「重新核实」后否定用户的选择；
+               只有当规格**确实不在**返回清单里时，才说明可用规格并请用户重选。
+            10. 【硬性要求】涉及下单时，**必须实际调用 prepare_order 工具**，绝不允许不调工具、
+                仅凭记忆或上下文就用文字罗列「商品/规格/数量/合计/收货地址」并让用户确认。
+                ⚠️ 你没有能力自行生成确认令牌——令牌只能由 prepare_order 返回。
+                任何由你自己写出来的令牌都是无效的，会造成用户下单失败。
+                正确顺序永远是：search_tea（拿到真实 productId）→ prepare_order（拿到令牌）→ 复述并等确认。
             """;
 
     /**
@@ -123,6 +152,7 @@ public class AgentOrchestrator {
                         "{\"confirmToken\":\"" + tok + "\"}");
                 trace.recordToolCall(traceId, cancel ? "cancel_order" : "confirm_order",
                         "{\"confirmToken\":\"" + tok + "\"}", 0, true);
+                if (!cancel) draft.clearPending(sessionId);
                 for (String piece : splitForStream(output)) {
                     onDelta.accept(piece);
                     sleep(12);
@@ -130,6 +160,47 @@ public class AgentOrchestrator {
                 memory.append(memoryScope, userInput, output);
                 onDone.accept(Map.of("traceId", traceId, "sessionId", sessionId,
                         "toolCalls", 1, "promptTokens", 0, "completionTokens", 0,
+                        "latencyMs", (int) (System.currentTimeMillis() - start), "costYuan", 0.0));
+                return;
+            }
+
+            // ---------- 裸确认/裸取消兜底（不经 LLM） ----------
+            // 用户说了确认类的词但没带令牌。绝不能放给 LLM：它没有令牌，
+            // 只能去"重新研究"，而研究用的数据不完整时会反过来否定用户已选对的东西。
+            String trimmed = userInput == null ? "" : userInput.trim();
+            boolean bareConfirm = BARE_CONFIRM_PATTERN.matcher(trimmed).matches();
+            boolean bareCancel = BARE_CANCEL_PATTERN.matcher(trimmed).matches();
+            if (bareConfirm || bareCancel) {
+                String pending = draft.pendingToken(sessionId);
+                String reply;
+                if (pending == null || pending.isBlank()) {
+                    reply = bareCancel
+                            ? "当前没有待确认的订单，不需要取消。想买什么直接告诉我就行～"
+                            : "当前没有待确认的订单草稿。请先告诉我您想买哪款茶（商品 + 规格 + 数量），"
+                                    + "我拟好单子后会生成一个确认令牌，带上令牌说「确认下单，令牌 X」即可完成。";
+                } else if (bareCancel) {
+                    tools.execute("cancel_order", "{\"confirmToken\":\"" + pending + "\"}");
+                    draft.clearPending(sessionId);
+                    reply = "已取消刚才那笔拟单，令牌已作废。需要重新下单随时说～";
+                } else {
+                    // 有待确认草稿但用户没带令牌 —— 把令牌明确交到他手上，一步到位
+                    reply = "您有一笔待确认的订单草稿，但确认需要带上令牌。\n"
+                            + "请回复：**确认下单，令牌 " + pending + "**\n"
+                            + "（令牌 5 分钟内有效；要放弃就说「取消」）";
+                }
+                onToolEvent.accept(Map.of("type", "confirm_guide",
+                        "hasPending", pending != null && !pending.isBlank(), "bare", trimmed));
+                for (String piece : splitForStream(reply)) {
+                    onDelta.accept(piece);
+                    sleep(12);
+                }
+                // 只有「取消」是真实业务动作，值得记住；纯引导话术不落记忆——
+                // 尤其其中含一次性令牌，写进长期记忆会让模型在后续轮次复述一个已失效的令牌。
+                if (bareCancel && pending != null && !pending.isBlank()) {
+                    memory.append(memoryScope, userInput, reply);
+                }
+                onDone.accept(Map.of("traceId", traceId, "sessionId", sessionId,
+                        "toolCalls", 0, "promptTokens", 0, "completionTokens", 0,
                         "latencyMs", (int) (System.currentTimeMillis() - start), "costYuan", 0.0));
                 return;
             }
@@ -164,6 +235,7 @@ public class AgentOrchestrator {
             // ---------- 3. ReAct 循环（受控自主） ----------
             String finalAnswer = null;
             boolean authExpired = false;
+            boolean blockedDraft = false;
             for (int i = 0; i < maxIterations; i++) {
                 // 走流式分片重组而非非流式：网关非流式会丢 tool_calls（见 LlmClient#chatViaStream）
                 ChatResult result = llm.chatViaStream(messages, toolsSchema);
@@ -210,7 +282,12 @@ public class AgentOrchestrator {
                     // 注意：这里在内层工具循环里，必须用标志位退出「外层」ReAct 循环——
                     // 直接 break 只跳出内层，下一轮 LLM 会带着「有 tool_calls 无 tool 结果」
                     // 的断裂消息序列被网关以 400 拒绝（首版实测踩中）。
-                    if (output.contains("\"authFailed\":true") || output.contains("401")) {
+                    //
+                    // ⚠️ 判定必须走结构化字段，不能裸子串匹配 "401"：
+                    // 老项目地址数据里 districtCode="340102" 就**含子串 401**，
+                    // 原先 output.contains("401") 会把正常的地址查询误判为鉴权失效，
+                    // 导致明明登录有效却回「登录已过期」，且该错误被写进跨会话记忆反复复发。
+                    if (isAuthFailure(output)) {
                         onToolEvent.accept(Map.of("type", "auth_expired"));
                         finalAnswer = "🔑 登录已过期，请重新登录后再继续，我在这等你回来。";
                         authExpired = true;
@@ -221,13 +298,21 @@ public class AgentOrchestrator {
                     if ("prepare_order".equals(call.name())) {
                         try {
                             JsonNode out = mapper.readTree(output);
-                            if (out.hasNonNull("confirmToken")) {
+                            if (out.hasNonNull("confirmToken") && !out.hasNonNull("error")) {
+                                String tk = out.path("confirmToken").asText();
+                                // 记录本会话有待确认草稿，供「裸确认」兜底识别
+                                draft.markPending(sessionId, tk);
                                 onToolEvent.accept(Map.of(
                                         "type", "confirm_ready",
-                                        "confirmToken", out.path("confirmToken").asText(),
+                                        "confirmToken", tk,
+                                        "confirmPhrase", "确认下单，令牌 " + tk,
                                         "summary", draftSummary(out.path("draft"))));
+                            } else if (out.hasNonNull("error")) {
+                                log.warn("[{}] prepare_order 被拒: {}", traceId, out.path("error").asText());
                             }
-                        } catch (Exception ignored) {
+                        } catch (Exception e) {
+                            // 不能静默吞：解析失败意味着前端收不到确认按钮，用户会卡住
+                            log.warn("[{}] prepare_order 结果解析失败: {} output={}", traceId, e.getMessage(), output);
                         }
                     }
 
@@ -247,6 +332,23 @@ public class AgentOrchestrator {
                 finalAnswer = "抱歉，我没能完成这个请求，请换个说法试试。";
             }
 
+            // ---------- 4.5 拦截「文本拟单」（未经工具的口头草稿） ----------
+            // 实测：模型有时**不调用 prepare_order**，而是用自然语言罗列订单信息、甚至编一个令牌，
+            // 让用户以为可以直接确认。这会导致：
+            //   ① 前端收不到 confirm_ready，渲染不出确认按钮；
+            //   ② Redis 里没有真草稿，用户回复确认时无处可确认，模型只好「重新研究」并可能否定用户；
+            //   ③ 最坏情况是编造令牌，用户以为下单成功。
+            // 这里做确定性纠正：只要话术像拟单、但本轮没有任何真实的 prepare_order 成功记录，就换成引导。
+            if (draft.pendingToken(sessionId) == null && looksLikeDraftClaim(finalAnswer)) {
+                log.warn("[{}] 检测到模型未调用 prepare_order 却输出拟单话术，已拦截并改为引导。原文={}",
+                        traceId, finalAnswer);
+                finalAnswer = "抱歉，刚才的订单信息未经系统核对，不能直接确认。\n"
+                        + "请告诉我您要买的**商品 + 规格 + 数量**（例如「武功山云雾 品鉴装50g 买1份」），"
+                        + "我会生成正式的订单草稿和确认令牌，那时再点确认即可。";
+                onToolEvent.accept(Map.of("type", "draft_blocked"));
+                blockedDraft = true;
+            }
+
             // ---------- 4. 流式输出最终答案 ----------
             // 说明：ReAct 循环里已用非流式拿完整结果；最终答案这里逐块吐出给前端。
             // 若要端到端真流式，可在最后一轮改用 llm.chatStream()。
@@ -257,7 +359,17 @@ public class AgentOrchestrator {
 
             // ---------- 5. 落库与记忆 ----------
             int latencyMs = (int) (System.currentTimeMillis() - start);
-            memory.append(memoryScope, userInput, finalAnswer);
+            // ⚠️ 只把「正常业务回答」写入长期记忆。
+            // 记忆域对登录用户是 u{userId}（跨会话共享），一旦把鉴权失败、拦截提示这类
+            // 过程性/错误性内容写进去，后续每一轮 LLM 都会读到，并**模仿自己的错误回答**
+            // （实测：几轮测试失败后，"登录已过期"被反复复用，即使 token 完全有效）。
+            // 这属于典型的「错误信息污染长期记忆 → 正反馈循环」，必须在这里挡住。
+            if (authExpired || blockedDraft) {
+                log.info("[{}] 本轮为异常/拦截收口，不写入长期记忆（authExpired={}, blockedDraft={}）",
+                        traceId, authExpired, blockedDraft);
+            } else {
+                memory.append(memoryScope, userInput, finalAnswer);
+            }
             trace.recordTrace(traceId, sessionId, "agent.run",
                     totalPromptTokens, totalCompletionTokens, latencyMs);
 
@@ -328,6 +440,60 @@ public class AgentOrchestrator {
     /** 判断是否需要走 RAG：问「是什么/怎么/为什么/区别」这类知识题才检索。 */
     private boolean needsKnowledge(String input) {
         return containsAny(input, "怎么", "如何", "为什么", "区别", "是什么", "功效", "保存", "冲泡", "工艺");
+    }
+
+    /**
+     * 判断工具返回是否代表「鉴权失效」。
+     *
+     * 必须严格按结构化语义判断，**禁止裸子串匹配 "401"**——业务数据里完全可能出现 401：
+     * 实测老项目地址数据含 districtCode="340102"，子串匹配会把正常查询误判为登录过期。
+     *
+     * 判定依据（任一命中）：
+     *  1. Feign 降级返回的结构化标记 authFailed=true（TearSpringClientFallback 产生）；
+     *  2. JSON 顶层 code 字段等于 401（老项目统一的 Result.code）；
+     *  3. 出现明确的鉴权错误文案（如"登录已过期"/"token 无效"）。
+     */
+    private boolean isAuthFailure(String output) {
+        if (output == null || output.isBlank()) return false;
+        String s = output.trim();
+
+        // 1) 降级工厂的结构化标记（最可靠）
+        try {
+            JsonNode node = mapper.readTree(s);
+            if (node.path("authFailed").asBoolean(false)) return true;
+            // 2) Result.code == 401
+            JsonNode code = node.path("code");
+            if (code.isNumber() && code.asInt() == 401) return true;
+            if (code.isTextual() && "401".equals(code.asText().trim())) return true;
+        } catch (Exception ignored) {
+            // 非 JSON（例如纯文本错误），落到下面的文案判断
+        }
+
+        // 3) 明确的鉴权失效文案（老项目/网关的固定措辞）
+        return containsAny(s, "登录已过期", "登录已失效", "token无效", "token 无效", "未登录", "请重新登录");
+    }
+
+    /**
+     * 判断回答是否在「口头拟单」：复述了**完整订单草稿**并引导用户确认，但实际没走 prepare_order。
+     *
+     * ⚠️ 判定必须严格，否则会误伤正常提问。实测踩过：模型问
+     * 「您的地址列表里有 7 条，请确认用哪个：」——这是**合理的澄清提问**（用户有多个地址需选一个），
+     * 却因为命中「确认」+「地址」被判成假拟单拦掉，导致用户永远走不到拟单。
+     *
+     * 真·假拟单的特征是**复述了订单要素的完整清单**，因此要求同时满足：
+     *  ① 有拟单语义（拟单/订单草稿/确认下单/令牌）；
+     *  ② 明确列了「商品」这一项（不是泛泛提到）；
+     *  ③ 同时给出金额（合计或单价）**和**收货信息（收货地址/收货人）。
+     * 「请确认用哪个地址」只满足①，不满足②③，因此不会被拦截。
+     */
+    private boolean looksLikeDraftClaim(String answer) {
+        if (answer == null || answer.isBlank()) return false;
+        boolean draftWords = containsAny(answer, "拟单", "订单草稿", "确认下单", "令牌");
+        if (!draftWords) return false;
+        boolean hasProductLine = containsAny(answer, "商品：", "商品:", "- 商品", "· 商品", "商品 ");
+        boolean hasAmount = containsAny(answer, "合计", "单价", "总价", "¥");
+        boolean hasAddress = containsAny(answer, "收货地址", "收货人", "送至", "寄往");
+        return hasProductLine && hasAmount && hasAddress;
     }
 
     private boolean containsAny(String text, String... keys) {

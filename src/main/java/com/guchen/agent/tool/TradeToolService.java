@@ -44,6 +44,50 @@ public class TradeToolService {
     private static final int MAX_QUANTITY = 10;
 
     /**
+     * 「本会话是否有待确认草稿」的标记键：sessionId → 「令牌」。
+     *
+     * 为什么需要它（真实缺陷修复）：
+     *  用户在小程序里点了确认、或直接打了个「确认」发出来，是**没有令牌**的——
+     *  而 confirm_order 必须凭令牌执行。原先这种输入会落到意图路由的「确认」分支，
+     *  放行 confirm_order/prepare_order 给 LLM，LLM 手上没有令牌，只好「重新研究一遍」，
+     *  结果用不完整的搜索结果推翻了用户的正确选择（实测：否定了真实存在的「品鉴装50g」，
+     *  连说三次「我无法按此下单」把用户卡死）。
+     *  有了这个标记，编排器就能在进 LLM 之前识别出「你想确认那单，但确认方式不对」，
+     *  直接给出确定性的引导文案，不再让 LLM 自由发挥。
+     */
+    private static final String PENDING_KEY_PREFIX = "agent:pending:";
+
+    /** 记录本会话存在待确认草稿（prepare_order 成功后调用）。 */
+    public void markPending(String sessionId, String confirmToken) {
+        if (sessionId == null || sessionId.isBlank()) return;
+        try {
+            redis.opsForValue().set(PENDING_KEY_PREFIX + sessionId, confirmToken, CONFIRM_TTL);
+        } catch (Exception e) {
+            log.debug("记录待确认草稿失败 session={}: {}", sessionId, e.getMessage());
+        }
+    }
+
+    /** 本会话是否有待确认草稿；返回令牌（无则 null）。 */
+    public String pendingToken(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return null;
+        try {
+            return redis.opsForValue().get(PENDING_KEY_PREFIX + sessionId);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 清理待确认标记（确认执行或取消后调用）。 */
+    public void clearPending(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return;
+        try {
+            redis.delete(PENDING_KEY_PREFIX + sessionId);
+        } catch (Exception e) {
+            log.debug("清理待确认标记失败 session={}: {}", sessionId, e.getMessage());
+        }
+    }
+
+    /**
      * 原子 GET+DEL（Lua）：令牌只能被消费一次。
      * 不用 Spring 的 getAndDelete()——它走 Redis 6.2 的 GETDEL 命令，
      * 本机 Redis 3.0.504 不支持；Lua 在老版本上同样原子。
