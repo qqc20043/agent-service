@@ -390,6 +390,8 @@ public class AgentOrchestrator {
             String finalAnswer = null;
             boolean authExpired = false;
             boolean blockedDraft = false;
+            boolean recommendPushed = false;              // 本轮是否已推过推荐卡片
+            List<String> lastSearchedProductIds = new ArrayList<>();  // 最近一次 search_tea 的商品 id
             for (int i = 0; i < maxIterations; i++) {
                 // 走流式分片重组而非非流式：网关非流式会丢 tool_calls（见 LlmClient#chatViaStream）
                 ChatResult result = llm.chatViaStream(messages, toolsSchema);
@@ -435,6 +437,37 @@ public class AgentOrchestrator {
                     //   让确认卡片上一并展示，用户不满意可点「修改」换地址后重新拟单。
                     String output;
                     if ("prepare_order".equals(call.name())) {
+                        // ===== 规格未确认时先弹选购卡片，不替用户决定（服务端强制） =====
+                        // 实测缺陷：用户说「推荐长辈喜欢的」→ 模型没调 recommend_tea 只报了茶名；
+                        // 用户接着说「就大红袍吧」→ 模型直接 prepare_order，**自己取了默认规格**下单。
+                        // 用户从没选过规格，却被替做了决定。
+                        // prompt 约束不可靠（模型可以无视），这里做硬校验：
+                        // 本轮用户没明确指定规格、也不是从卡片点选过来的，就先推规格卡片让用户选。
+                        boolean userPickedSpec = ps.matches()          // 来自推荐卡片「选这个」
+                                || specMentionedByUser(trimmed);        // 用户话里明确说了规格/装量
+                        if (!userPickedSpec) {
+                            long pidForPick = mapper.readTree(call.arguments()).path("productId").asLong(0);
+                            if (pidForPick > 0) {
+                                String cardsJson = tools.execute("recommend_tea",
+                                        "{\"productIds\":[" + pidForPick + "]}");
+                                try {
+                                    JsonNode cards = mapper.readTree(cardsJson).path("cards");
+                                    if (cards.isArray() && !cards.isEmpty()) {
+                                        onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
+                                        log.info("[{}] 用户未指定规格，已拦截拟单并推规格卡片 productId={}",
+                                                traceId, pidForPick);
+                                        // 不执行 prepare_order，改由用户点选规格后再走「选购」直通
+                                        messages.add(Message.tool(call.id(), call.name(),
+                                                "{\"needSpecPick\":true,\"note\":\"已向用户展示规格卡片，"
+                                                + "请等待用户点选后再拟单，不要自行选择规格\"}"));
+                                        toolCallCount--;
+                                        continue;
+                                    }
+                                } catch (Exception e) {
+                                    log.warn("[{}] 规格卡片推送失败，放行拟单: {}", traceId, e.getMessage());
+                                }
+                            }
+                        }
                         output = tools.execute(call.name(), call.arguments());
                         try {
                             JsonNode out = mapper.readTree(output);
@@ -542,10 +575,28 @@ public class AgentOrchestrator {
                             JsonNode cards = out.path("cards");
                             if (cards.isArray() && !cards.isEmpty()) {
                                 onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
+                                recommendPushed = true;
                                 log.debug("[{}] 已推送推荐卡片 {} 张", traceId, cards.size());
                             }
                         } catch (Exception e) {
                             log.warn("[{}] 推荐卡片解析失败: {}", traceId, e.getMessage());
+                        }
+                    }
+
+                    // 记录 search_tea 命中的商品 id，供「推荐意图兜底补推卡片」使用
+                    if ("search_tea".equals(call.name())) {
+                        try {
+                            JsonNode list = mapper.readTree(output).path("ShopSpecList");
+                            if (list.isArray()) {
+                                lastSearchedProductIds.clear();
+                                for (JsonNode it : list) {
+                                    long id = it.path("id").asLong(0);
+                                    if (id > 0 && lastSearchedProductIds.size() < 5) {
+                                        lastSearchedProductIds.add(String.valueOf(id));
+                                    }
+                                }
+                            }
+                        } catch (Exception ignored) {
                         }
                     }
 
@@ -643,6 +694,88 @@ public class AgentOrchestrator {
 
             if (finalAnswer == null) {
                 finalAnswer = "抱歉，我没能完成这个请求，请换个说法试试。";
+            }
+
+            // ---------- 4.4 推荐场景兜底：模型没推卡片时补推 ----------
+            // 实测缺陷：用户说「推荐长辈喜欢的」，模型 tool_calls=0 纯文字回复，
+            // 没调 recommend_tea → 前端收不到卡片 → 用户只能靠文字里提到的茶名回一句
+            // 「就大红袍吧」，然后又因为没有规格卡片而被模型自作主张拟单。
+            // prompt 规则不可靠（模型可以无视），这里做服务端兜底。
+            if (!recommendPushed && isRecommendIntent(trimmed)) {
+                try {
+                    // 情形 A：本轮搜过商品 → 直接拿搜索结果补推卡片（不再花 LLM 调用）
+                    if (!lastSearchedProductIds.isEmpty()) {
+                        String cardsJson = tools.execute("recommend_tea",
+                                "{\"productIds\":[" + String.join(",", lastSearchedProductIds) + "]}");
+                        JsonNode cards = mapper.readTree(cardsJson).path("cards");
+                        if (cards.isArray() && !cards.isEmpty()) {
+                            onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
+                            recommendPushed = true;
+                            log.info("[{}] 推荐意图未推卡片，已用搜索结果补推 {} 张", traceId, cards.size());
+                        }
+                    }
+                    // 情形 B：本轮连搜都没搜（模型凭上下文直接作答）→ 追一轮强制它调 recommend_tea。
+                    // 此时模型刚在文字里报过茶名，带着上下文再问一次，它知道该推荐什么。
+                    if (!recommendPushed) {
+                        List<Message> nudge = new ArrayList<>(messages);
+                        nudge.add(Message.assistant(finalAnswer));
+                        nudge.add(Message.system("【系统指令】你刚才的推荐没有生成选购卡片，用户无法点选。"
+                                + "请先用 search_tea 确认商品，再调用 recommend_tea 把推荐的商品登记成卡片。"
+                                + "本轮只做这两件事，不要输出长篇文字。"));
+                        ArrayNode nudgeTools = tools.buildToolsSchema(
+                                List.of("search_tea", "recommend_tea"));
+                        for (int k = 0; k < 2 && !recommendPushed; k++) {
+                            ChatResult nr = llm.chatViaStream(nudge, nudgeTools);
+                            totalPromptTokens += nr.usage().promptTokens();
+                            totalCompletionTokens += nr.usage().completionTokens();
+                            if (!nr.hasToolCalls()) break;
+                            nudge.add(Message.assistantWithToolCalls(nr.content(),
+                                    Message.toolCallsToArray(mapper, nr.toolCalls())));
+                            for (ToolCall c : nr.toolCalls()) {
+                                String o = tools.execute(c.name(), c.arguments());
+                                if ("search_tea".equals(c.name())) {
+                                    try {
+                                        JsonNode list = mapper.readTree(o).path("ShopSpecList");
+                                        if (list.isArray()) {
+                                            lastSearchedProductIds.clear();
+                                            for (JsonNode it : list) {
+                                                long id = it.path("id").asLong(0);
+                                                if (id > 0 && lastSearchedProductIds.size() < 5) {
+                                                    lastSearchedProductIds.add(String.valueOf(id));
+                                                }
+                                            }
+                                        }
+                                    } catch (Exception ignored) {
+                                    }
+                                }
+                                if ("recommend_tea".equals(c.name())) {
+                                    try {
+                                        JsonNode cards = mapper.readTree(o).path("cards");
+                                        if (cards.isArray() && !cards.isEmpty()) {
+                                            onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
+                                            recommendPushed = true;
+                                            log.info("[{}] 追一轮后补推推荐卡片 {} 张", traceId, cards.size());
+                                        }
+                                    } catch (Exception ignored) {
+                                    }
+                                }
+                                nudge.add(Message.tool(c.id(), c.name(), truncate(o, 2000)));
+                            }
+                        }
+                        // 兜底仍失败：退化为用搜索到的商品直接推
+                        if (!recommendPushed && !lastSearchedProductIds.isEmpty()) {
+                            String cardsJson = tools.execute("recommend_tea",
+                                    "{\"productIds\":[" + String.join(",", lastSearchedProductIds) + "]}");
+                            JsonNode cards = mapper.readTree(cardsJson).path("cards");
+                            if (cards.isArray() && !cards.isEmpty()) {
+                                onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
+                                recommendPushed = true;
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    log.debug("[{}] 推荐卡片兜底失败: {}", traceId, e.getMessage());
+                }
             }
 
             // ---------- 4.5 拦截「文本拟单」（未经工具的口头草稿） ----------
@@ -765,6 +898,35 @@ public class AgentOrchestrator {
     /** 判断是否需要走 RAG：问「是什么/怎么/为什么/区别」这类知识题才检索。 */
     private boolean needsKnowledge(String input) {
         return containsAny(input, "怎么", "如何", "为什么", "区别", "是什么", "功效", "保存", "冲泡", "工艺");
+    }
+
+    /**
+     * 判断用户是否在请求**推荐**茶叶（而非查询具体商品或下单）。
+     * 用于「模型没推卡片时兜底补推」——推荐场景必须有卡片，否则用户只能靠文字里的茶名
+     * 回一句「就XX吧」，进而被模型自作主张拟单（实测踩中）。
+     */
+    private boolean isRecommendIntent(String q) {
+        if (q == null || q.isBlank()) return false;
+        return containsAny(q, "推荐", "有什么好", "哪些好", "送什么", "送长辈", "送礼",
+                "适合", "挑几款", "选几款", "来几款", "什么茶好", "好喝");
+    }
+
+    /**
+     * 判断用户这句话里是否**明确指定了规格/装量**。
+     * 用于决定「能不能直接拟单」——用户没说规格时，不能让模型替他挑一个默认规格。
+     *
+     * 判定依据：出现装量单位或规格类别词。
+     * 例如「就大红袍吧」→ false（该弹规格卡片）；
+     *     「大红袍 标准装100g」→ true（可以直接拟单）。
+     */
+    private boolean specMentionedByUser(String q) {
+        if (q == null || q.isBlank()) return false;
+        // 装量：数字 + g/克/斤/两/盒/罐/袋
+        if (java.util.regex.Pattern.compile("\\d+\\s*(g|G|克|kg|KG|斤|两|ml|ML|毫升|片|颗|罐|袋|盒)")
+                .matcher(q).find()) return true;
+        // 规格类别词
+        return containsAny(q, "品鉴装", "标准装", "礼盒装", "家庭装", "收藏装", "散装", "罐装",
+                "袋装", "小罐", "大包装", "小包装", "体验装", "试用装");
     }
 
     /**
