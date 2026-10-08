@@ -85,6 +85,15 @@ public class AgentOrchestrator {
     private static final java.util.regex.Pattern PICK_ADDRESS_PATTERN =
             java.util.regex.Pattern.compile("^\\s*用地址\\s*[:：]?\\s*(\\d{1,12})\\s*$");
 
+    /**
+     * 推荐卡片选购协议：前端点「选这个」后发出「选购 <productId> <specId> <qty>」。
+     * 这是**结构化指令**——商品、规格、数量都由用户在卡片上点定，
+     * 后端直接用它拟单，不必再让模型解析「用户想要哪个规格」，
+     * 也就省掉了原来那轮「请问要什么规格」的追问。
+     */
+    private static final java.util.regex.Pattern PICK_SPEC_PATTERN =
+            java.util.regex.Pattern.compile("^\\s*选购\\s+(\\d{1,12})\\s+(\\d{1,12})\\s+(\\d{1,3})\\s*$");
+
     private static final String SYSTEM_PROMPT = """
             你是「漫思茶」电商平台的智能茶饮顾问，负责帮用户找茶、问茶、下单。
 
@@ -135,6 +144,13 @@ public class AgentOrchestrator {
                 不调工具时购物车实际是空的，这是欺骗用户。
                 规格/数量缺省时按默认规格、1 份直接加，不要反问。
                 系统会在加购成功后自动展示购物车内容，你不需要复述购物车清单。
+            12. 【推荐茶叶：必须生成选购卡片】
+                ⚠️ 当你向用户**推荐**茶叶（「推荐几款绿茶」「送长辈什么茶」等）时，
+                必须先 search_tea 拿到真实商品，再调用 **recommend_tea** 把推荐商品登记成卡片
+                （productIds 取自搜索结果）。
+                调用后**只用一两句话说明推荐理由**即可——
+                **不要再逐条罗列规格和价格**（卡片上已经展示），也不要问「您要哪个规格」，
+                用户会直接在卡片上点选并选择规格。重复罗列会让用户觉得啰嗦。
             """;
 
     /**
@@ -241,6 +257,77 @@ public class AgentOrchestrator {
                 }
                 onDone.accept(Map.of("traceId", traceId, "sessionId", sessionId,
                         "toolCalls", 0, "promptTokens", 0, "completionTokens", 0,
+                        "latencyMs", (int) (System.currentTimeMillis() - start), "costYuan", 0.0));
+                return;
+            }
+
+            // ---------- 0.5 推荐卡片选购直通（不经 LLM） ----------
+            // 前端点「选这个」→ 发「选购 <productId> <specId> <qty>」。
+            // 商品/规格/数量都是用户在卡片上点定的结构化数据，直接拟单即可——
+            // 这正是这个卡片存在的意义：省掉「请问要什么规格」那一轮追问。
+            // 交给 LLM 反而有风险（它可能重新研究、甚至换掉用户选的规格）。
+            java.util.regex.Matcher ps = PICK_SPEC_PATTERN.matcher(trimmed);
+            if (ps.matches()) {
+                long pid = Long.parseLong(ps.group(1));
+                long sid = Long.parseLong(ps.group(2));
+                int qty = Integer.parseInt(ps.group(3));
+                // 作废旧草稿：避免两个令牌同时有效
+                String stale = draft.pendingToken(sessionId);
+                if (stale != null && !stale.isBlank()) {
+                    tools.execute("cancel_order", "{\"confirmToken\":\"" + stale + "\"}");
+                }
+                String args = "{\"productId\":" + pid + ",\"specId\":" + sid + ",\"quantity\":" + qty + "}";
+                log.info("[{}] 推荐卡片选购直通：productId={} specId={} qty={}", traceId, pid, sid, qty);
+                onToolEvent.accept(Map.of("type", "tool_call", "name", "prepare_order",
+                        "write", false, "args", args));
+                String out = tools.execute("prepare_order", args);
+                trace.recordToolCall(traceId, "prepare_order", args, 0, false);
+                try {
+                    JsonNode node = mapper.readTree(out);
+                    if (node.hasNonNull("confirmToken") && !node.hasNonNull("error")) {
+                        String tk = node.path("confirmToken").asText();
+                        JsonNode d = node.path("draft");
+                        draft.markPending(sessionId, tk);
+                        ObjectNode payload = mapper.createObjectNode();
+                        payload.put("type", "confirm_ready");
+                        payload.put("confirmToken", tk);
+                        payload.put("confirmPhrase", "确认下单，令牌 " + tk);
+                        payload.put("summary", draftSummary(d));
+                        payload.put("productName", d.path("productName").asText());
+                        payload.put("productEmoji", d.path("productEmoji").asText());
+                        payload.put("specName", d.path("specName").asText());
+                        payload.put("quantity", d.path("quantity").asInt());
+                        payload.put("unitPrice", d.path("unitPrice").asDouble());
+                        payload.put("subtotal", d.path("subtotal").asDouble());
+                        payload.put("shopName", d.path("shopName").asText());
+                        payload.put("addressId", d.path("addressId").asLong());
+                        payload.put("addressSummary", d.path("addressSummary").asText());
+                        onToolEvent.accept(mapper.convertValue(payload,
+                                new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}));
+                    } else {
+                        // 拟单失败（商品/规格/库存问题）：把工具给的原因如实转达
+                        String msg = node.path("error").asText("下单信息有误，请重新选择");
+                        for (String piece : splitForStream("⚠️ " + msg)) {
+                            onDelta.accept(piece);
+                            sleep(12);
+                        }
+                        onDone.accept(Map.of("traceId", traceId, "sessionId", sessionId,
+                                "toolCalls", 1, "promptTokens", 0, "completionTokens", 0,
+                                "latencyMs", (int) (System.currentTimeMillis() - start), "costYuan", 0.0));
+                        return;
+                    }
+                } catch (Exception e) {
+                    log.warn("[{}] 选购直通拟单解析失败: {}", traceId, e.getMessage());
+                }
+                String reply = "好的，已为您拟好订单。请在上方确认卡片核对商品、规格、金额与收货地址，"
+                        + "没问题就点「确认购买」；要改地址可以点「修改」。";
+                for (String piece : splitForStream(reply)) {
+                    onDelta.accept(piece);
+                    sleep(12);
+                }
+                memory.append(memoryScope, userInput, reply);
+                onDone.accept(Map.of("traceId", traceId, "sessionId", sessionId,
+                        "toolCalls", 1, "promptTokens", 0, "completionTokens", 0,
                         "latencyMs", (int) (System.currentTimeMillis() - start), "costYuan", 0.0));
                 return;
             }
@@ -444,6 +531,21 @@ public class AgentOrchestrator {
                             }
                         } catch (Exception e) {
                             log.warn("[{}] 地址列表解析失败: {} output={}", traceId, e.getMessage(), output);
+                        }
+                    }
+
+                    // 推荐选购卡片：模型调 recommend_tea 时，把卡片推给前端渲染成可点选列表。
+                    // 用户点「选这个」→ 选规格数量 → 直接拟单，不必再让模型追问规格。
+                    if ("recommend_tea".equals(call.name())) {
+                        try {
+                            JsonNode out = mapper.readTree(output);
+                            JsonNode cards = out.path("cards");
+                            if (cards.isArray() && !cards.isEmpty()) {
+                                onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
+                                log.debug("[{}] 已推送推荐卡片 {} 张", traceId, cards.size());
+                            }
+                        } catch (Exception e) {
+                            log.warn("[{}] 推荐卡片解析失败: {}", traceId, e.getMessage());
                         }
                     }
 
@@ -654,8 +756,10 @@ public class AgentOrchestrator {
             return List.of("confirm_order", "cancel_order", "prepare_order", "search_tea", "get_tea_detail");
 
         // 兜底：只读工具
-        return List.of("search_tea", "get_tea_detail", "list_themes", "list_categories",
-                "view_cart", "list_orders");
+        // 含 recommend_tea —— 推荐类问题（「推荐几款绿茶」）常落到这里，
+        // 必须给模型推荐卡片工具，否则它只能用纯文字罗列，用户还得自己说要哪个规格。
+        return List.of("search_tea", "get_tea_detail", "recommend_tea", "list_themes",
+                "list_categories", "view_cart", "list_orders");
     }
 
     /** 判断是否需要走 RAG：问「是什么/怎么/为什么/区别」这类知识题才检索。 */

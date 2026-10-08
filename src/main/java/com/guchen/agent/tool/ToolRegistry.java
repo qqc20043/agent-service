@@ -79,6 +79,18 @@ public class ToolRegistry {
                 params(Map.of("shopId", "integer"), List.of("shopId")), false,
                 args -> tearSpring.shopProducts(Map.of("id", args.path("shopId").asInt())));
 
+        // ---------- 推荐选购（只读，前端渲染成可点选卡片） ----------
+        // 为什么需要：模型推荐完茶之后，用户说"下单"时还得再问一遍"要哪个规格"，
+        // 体验上多一轮。用这个工具登记推荐商品后，前端直接渲染成带规格的选购卡片，
+        // 用户点「选这个」→ 选规格数量 → 直接拟单，全程不必再问规格。
+        register("recommend_tea", "把要推荐给用户的茶叶登记成可选购卡片（只读，无副作用）。"
+                        + "⚠️ 当你向用户推荐茶叶时**必须**调用本工具，前端据此渲染成可点选的卡片，"
+                        + "用户点一下就能直接选购（含规格与数量），无需你逐个追问规格。"
+                        + "productIds 只能取自 search_tea 的真实结果，禁止编造；一次 1-5 个。"
+                        + "调用后只需简短说明推荐理由，**不要再逐条罗列规格与价格**（卡片上已经有了）。",
+                params(Map.of("productIds", "array"), List.of("productIds")), false,
+                args -> recommendTea(args));
+
         // ---------- 写操作工具（需幂等） ----------
         register("add_to_cart", "将商品加入购物车。productId/specId 必须来自 search_tea 与 get_tea_detail 的真实结果，禁止编造",
                 params(Map.of("productId", "integer", "specId", "integer", "quantity", "integer"),
@@ -236,6 +248,61 @@ public class ToolRegistry {
                     + "请按商品名重新调用 search_tea 获取正确 id，不要凭记忆或推测编造");
         }
         return tearSpring.productDetail(Map.of("id", (int) productId));
+    }
+
+    /**
+     * 推荐选购：把商品登记成前端可渲染的选购卡片。
+     * 返回结构与 searchTea 的 specs 一致，前端直接拿来做规格选择。
+     * 失败项不抛错（跳过即可），保证推荐主流程不被个别商品拖垮。
+     */
+    private String recommendTea(JsonNode args) {
+        JsonNode ids = args.path("productIds");
+        if (!ids.isArray() || ids.isEmpty()) return err("productIds 必填，且必须来自 search_tea 的真实结果");
+
+        ArrayNode cards = mapper.createArrayNode();
+        int limit = Math.min(ids.size(), 5);
+        for (int i = 0; i < limit; i++) {
+            long pid = ids.get(i).asLong(0);
+            if (pid <= 0) continue;
+            JsonNode product = findProductInList(pid);
+            if (product == null) {
+                log.debug("推荐跳过不存在的商品 id={}", pid);
+                continue;
+            }
+            ObjectNode card = mapper.createObjectNode();
+            card.put("productId", pid);
+            card.put("productName", product.path("name").asText());
+            card.put("productEmoji", product.path("emoji").asText());
+            card.put("subtitle", product.path("subtitle").asText());
+            card.put("origin", product.path("originDetail").asText());
+            // 完整规格清单（前端据此渲染规格选择，避免再问用户一遍）
+            JsonNode specs = loadSpecs(pid);
+            ArrayNode specArr = mapper.createArrayNode();
+            if (specs != null && specs.isArray()) {
+                for (JsonNode s : specs) {
+                    ObjectNode one = mapper.createObjectNode();
+                    one.put("specId", s.path("id").asLong());
+                    one.put("specName", s.path("specName").asText());
+                    one.put("price", s.path("price").asDouble());
+                    one.put("stock", s.path("stock").asInt());
+                    one.put("isDefault", s.path("isDefault").asInt());
+                    specArr.add(one);
+                }
+            }
+            if (specArr.isEmpty()) continue;
+            card.set("specs", specArr);
+            cards.add(card);
+        }
+        if (cards.isEmpty()) {
+            return err("没有可推荐的商品（productIds 必须来自 search_tea 的真实结果）");
+        }
+        ObjectNode out = mapper.createObjectNode();
+        out.put("action", "RECOMMENDED");
+        out.put("count", cards.size());
+        out.put("instruction", "已生成可选购卡片。请只用一两句话说明推荐理由，"
+                + "**不要**再逐条罗列规格和价格——卡片上已经展示，重复会让用户觉得啰嗦。");
+        out.set("cards", cards);
+        return json(out);
     }
 
     /** 加购前校验：商品存在 + specId 属于该商品（否则老项目会加进一个幽灵组合）。 */

@@ -11,6 +11,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -40,6 +41,7 @@ public class AgentChatController {
     private final AgentOrchestrator orchestrator;
     private final SessionMemoryService memoryService;
     private final LlmClient llmClient;
+    private final com.guchen.agent.memory.UserContextService userContext;
 
     /** 专用线程池：Agent 任务可能跑十几秒，不能占 Tomcat 线程 */
     private final ExecutorService agentPool = Executors.newFixedThreadPool(16, r -> {
@@ -113,11 +115,54 @@ public class AgentChatController {
         return Map.of("sessionId", sessionId, "answer", sb.toString());
     }
 
-    /** 清空会话记忆 */
+    /**
+     * 清空会话记忆。
+     *
+     * ⚠️ 必须同时清两个域：登录用户的记忆域是 u{userId}（跨会话共享），
+     * 只清 s{sessionId} 的话，用户下次进页面 restoreHistory 又会把旧记录拉回来——
+     * 表现为「点了清空，重进记录还在」。
+     */
     @DeleteMapping("/session/{sessionId}")
-    public Map<String, Object> clear(@PathVariable String sessionId) {
+    public Map<String, Object> clear(@PathVariable String sessionId, HttpServletRequest httpReq) {
         memoryService.clear(sessionId);
-        return Map.of("cleared", true, "sessionId", sessionId);
+        Long userId = userContext.resolveUserId(httpReq.getHeader("token"));
+        if (userId != null) {
+            memoryService.clear("u" + userId);
+        }
+        return Map.of("cleared", true, "sessionId", sessionId, "loggedIn", userId != null);
+    }
+
+    /**
+     * 拉取当前用户的对话历史（用于退出页面再进入时恢复聊天记录）。
+     *
+     * 为什么按「用户身份」而不是 sessionId 查：
+     *  记忆域对登录用户是 u{userId}（跨会话/跨设备共享，见 UserContextService）。
+     *  前端每次进页面都会新建 sessionId，若按 sessionId 查会永远查不到东西。
+     *  按 userId 查才能做到「登录期间退出重进，聊天记录还在」。
+     *  未登录（token 无效）时退回按 sessionId 查，保证匿名访客也能看到本会话记录。
+     *
+     * @param sessionId 当前页面会话 id（匿名时用作记忆域）
+     */
+    @GetMapping("/history")
+    public Map<String, Object> history(@RequestParam(required = false) String sessionId,
+                                       HttpServletRequest httpReq) {
+        String token = httpReq.getHeader("token");
+        Long userId = userContext.resolveUserId(token);
+        String scope = (userId != null) ? ("u" + userId)
+                : (sessionId != null && !sessionId.isBlank() ? "s" + sessionId : null);
+        if (scope == null) {
+            return Map.of("messages", java.util.List.of(), "scope", "", "loggedIn", false);
+        }
+        List<Map<String, String>> out = new java.util.ArrayList<>();
+        for (LlmClient.Message m : memoryService.loadHistory(scope)) {
+            // 只回传 user / assistant 两类，system 类的内部提示不暴露给前端
+            String role = m.role();
+            if (!"user".equals(role) && !"assistant".equals(role)) continue;
+            String content = m.content();
+            if (content == null || content.isBlank()) continue;
+            out.add(Map.of("role", role, "content", content));
+        }
+        return Map.of("messages", out, "scope", scope, "loggedIn", userId != null);
     }
 
     /**
