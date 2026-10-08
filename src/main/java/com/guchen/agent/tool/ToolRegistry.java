@@ -79,6 +79,12 @@ public class ToolRegistry {
                 params(Map.of("shopId", "integer"), List.of("shopId")), false,
                 args -> tearSpring.shopProducts(Map.of("id", args.path("shopId").asInt())));
 
+        // 全库商品清单（仅供编排器做「用户点名的茶是否唯一存在」判定，不投喂给 LLM）
+        // 与 search_tea 的区别：不做关键词过滤、不封顶 10 条、不带规格，纯 id+name。
+        register("all_products", "获取商品全库清单（内部用，供名称唯一性判定）",
+                emptyParams(), false,
+                args -> allProducts());
+
         // ---------- 推荐选购（只读，前端渲染成可点选卡片） ----------
         // 为什么需要：模型推荐完茶之后，用户说"下单"时还得再问一遍"要哪个规格"，
         // 体验上多一轮。用这个工具登记推荐商品后，前端直接渲染成带规格的选购卡片，
@@ -248,6 +254,30 @@ public class ToolRegistry {
                     + "请按商品名重新调用 search_tea 获取正确 id，不要凭记忆或推测编造");
         }
         return tearSpring.productDetail(Map.of("id", (int) productId));
+    }
+
+    /**
+     * 全库商品清单（精简版：只有 id 与 name）。
+     * 供编排器做「用户点名的茶在全库是否唯一存在」的判定，不投喂给 LLM。
+     */
+    private String allProducts() {
+        try {
+            JsonNode list = mapper.readTree(tearSpring.searchProductRaw()).path("ShopSpecList");
+            if (!list.isArray()) return err("商品清单不可用");
+            ArrayNode slim = mapper.createArrayNode();
+            for (JsonNode it : list) {
+                ObjectNode one = mapper.createObjectNode();
+                one.put("id", it.path("id").asLong());
+                one.put("name", it.path("name").asText());
+                slim.add(one);
+            }
+            ObjectNode out = mapper.createObjectNode();
+            out.put("code", 200);
+            out.set("ShopSpecList", slim);
+            return json(out);
+        } catch (Exception e) {
+            return err("读取商品清单失败: " + e.getMessage());
+        }
     }
 
     /**

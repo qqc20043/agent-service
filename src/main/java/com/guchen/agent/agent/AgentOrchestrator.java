@@ -885,37 +885,122 @@ public class AgentOrchestrator {
      * 从用户这句话里，找出他选中的是哪款茶。
      *
      * 用在「两阶段推荐」的第 2 阶段：用户看完文字推荐后说「就大红袍吧」，
-     * 这里把「大红袍」匹配到候选商品，据此推该款的规格卡片。
+     * 这里把「大红袍」匹配到商品，据此推该款的规格卡片。
      *
-     * 匹配策略（从精确到宽松）：
-     *  ① 商品全名出现在用户话里（「大红袍」⊂「就大红袍吧」）；
-     *  ② 商品名去掉品类后缀后仍能匹配（「洞庭碧螺春」→「碧螺春」）；
-     *  ③ 唯一候选时直接选中（用户说「就它吧」，只有一款推荐的情况下意图明确）。
-     * 匹配不到返回 null（不硬猜，避免推错款）。
+     * 匹配原则（严格，宁可不匹配也不推错）：
+     *  ① **商品全名出现在用户话里** → 命中（「就铁观音吧」⊃「铁观音」）；
+     *  ② 用户说的词是商品名的一部分，且**全库只有一个**商品名包含它 → 命中
+     *     （「那就龙井吧」→ 全库仅「明前龙井」含"龙井" → 唯一，命中）；
+     *  ③ 若命中多款（如「就红茶吧」→ 祁门红茶+英德红茶）→ **不匹配**，
+     *     交给模型用文字追问「您说的是祁门红茶还是英德红茶？」，
+     *     而不是替他挑一款。
+     *
+     * 匹配不到返回 null（不硬猜）。
      */
     private JsonNode pickMentionedTea(String userInput, List<JsonNode> pool) {
-        if (userInput == null || pool == null || pool.isEmpty()) return null;
+        if (userInput == null) return null;
         String q = userInput.trim();
-        // ① 全名匹配
-        for (JsonNode c : pool) {
-            String name = c.path("productName").asText("");
-            if (!name.isEmpty() && q.contains(name)) return c;
+
+        // 先取全库清单——唯一性判定必须基于全库，不能用候选或 search_tea 的召回结果
+        // （search_tea 有降级召回且封顶 10 条，用它判"唯一"会把多款误判成唯一）。
+        JsonNode all = null;
+        try {
+            JsonNode node = mapper.readTree(tools.execute("all_products", "{}")).path("ShopSpecList");
+            if (node.isArray() && !node.isEmpty()) all = node;
+        } catch (Exception e) {
+            log.debug("取全库清单失败: {}", e.getMessage());
         }
-        // ② 去掉常见地域/前缀后缀后再匹配（「洞庭碧螺春」→「碧螺春」，「武夷山大红袍」→「大红袍」）
-        for (JsonNode c : pool) {
-            String name = c.path("productName").asText("");
-            if (name.length() < 3) continue;
-            // 取名字的后 2-4 字作为核心词（中文茶名核心通常在尾部）
-            for (int len = Math.min(4, name.length()); len >= 2; len--) {
-                String core = name.substring(name.length() - len);
-                if (core.length() >= 2 && q.contains(core)) return c;
+
+        // ① 严格全名匹配：商品名完整出现在用户话里（对候选和全库都适用）
+        List<JsonNode> searchSpace = new ArrayList<>(pool);
+        if (all != null) {
+            for (JsonNode it : all) searchSpace.add(it);
+        }
+        for (JsonNode it : searchSpace) {
+            String name = productNameOf(it);
+            if (!name.isEmpty() && q.contains(name)) {
+                JsonNode card = buildCardFor(it);
+                if (card != null) {
+                    log.info("匹配命中「{}」（用户原话：{}）", name, q);
+                    return card;
+                }
             }
         }
-        // ③ 唯一候选 + 用户表达了"就这个"的意向
-        if (pool.size() == 1 && containsAny(q, "就这个", "就它", "这个吧", "它吧", "要这个", "买这个")) {
-            return pool.get(0);
+
+        // ② 唯一性放宽：用户说的词是商品名的一部分，且全库只有一个商品名包含它
+        String teaWord = extractTeaWord(q);
+        if (teaWord.length() >= 2 && all != null) {
+            JsonNode unique = null;
+            int hits = 0;
+            for (JsonNode it : all) {
+                String name = productNameOf(it);
+                if (!name.isEmpty() && name.contains(teaWord)) {
+                    hits++;
+                    unique = it;
+                }
+            }
+            if (hits == 1 && unique != null) {
+                JsonNode card = buildCardFor(unique);
+                if (card != null) {
+                    log.info("唯一匹配命中「{}」（用户说：{}）", productNameOf(unique), teaWord);
+                    return card;
+                }
+            } else if (hits > 1) {
+                // 多款命中：不推卡片，让模型用文字追问是哪一款
+                log.info("用户说的「{}」命中 {} 款，不唯一，不推卡片（交由模型追问）", teaWord, hits);
+            }
+        }
+
+        // ③ 候选只有一款 + 用户表达「就这个」意向（此时意图明确，不算替用户决定）
+        if (pool != null && pool.size() == 1
+                && containsAny(q, "就这个", "就它", "这个吧", "它吧", "要这个", "买这个")) {
+            JsonNode card = buildCardFor(pool.get(0));
+            if (card != null) return card;
         }
         return null;
+    }
+
+    /** 用商品 id 生成一张含完整规格的选购卡片；失败返回 null。 */
+    private JsonNode buildCardFor(JsonNode product) {
+        try {
+            long pid = product.path("id").asLong(0);
+            if (pid <= 0) pid = product.path("productId").asLong(0);
+            if (pid <= 0) return null;
+            String cardsJson = tools.execute("recommend_tea", "{\"productIds\":[" + pid + "]}");
+            JsonNode cards = mapper.readTree(cardsJson).path("cards");
+            if (cards.isArray() && !cards.isEmpty()) return cards.get(0);
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * 从用户话里提取"茶名词"：去掉语气词、指令词与标点后剩下的核心部分。
+     * 「那就龙井吧」→「龙井」；「就大红袍吧」→「大红袍」；「我要铁观音」→「铁观音」。
+     */
+    private String extractTeaWord(String q) {
+        if (q == null) return "";
+        String s = q.trim();
+        // 去掉常见语气/指令词
+        for (String w : new String[]{"那就", "就", "我要", "要", "来", "买", "选", "吧", "了",
+                "这个", "它", "的", "呢", "啊", "呀", "哈", "好", "行", "可以", "OK", "ok"}) {
+            s = s.replace(w, "");
+        }
+        // 去掉标点与空白
+        s = s.replaceAll("[\\s，,。.！!？?、~～:：;；\"'“”‘’()（）]", "");
+        return s;
+    }
+
+    /**
+     * 取商品名，兼容两种来源的字段名：
+     *  - recommend_tea 生成的卡片用 `productName`（我们自己构造的）
+     *  - search_tea 透传的老项目商品用 `name`
+     * 混用会导致匹配静默失效（实测踩过：全库匹配永远返回 null）。
+     */
+    private String productNameOf(JsonNode node) {
+        String n = node.path("productName").asText("");
+        if (n.isEmpty()) n = node.path("name").asText("");
+        return n;
     }
 
     /**
