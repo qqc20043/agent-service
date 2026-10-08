@@ -128,6 +128,13 @@ public class AgentOrchestrator {
                 ⚠️ 你没有能力自行生成确认令牌——令牌只能由 prepare_order 返回。
                 任何由你自己写出来的令牌都是无效的，会造成用户下单失败。
                 正确顺序永远是：search_tea（拿到真实 productId）→ prepare_order（拿到令牌）→ 复述并等确认。
+            11. 【加入购物车：直接执行，不要确认】
+                ⚠️ 加购是**低风险操作**，不需要用户二次确认，也**不要**说「回复确认我就提交」这类话——
+                用户说「加入购物车」就是要加，直接调用 add_to_cart 完成即可。
+                同样**必须真调 add_to_cart 工具**，绝不能只用文字说「已为您加入购物车」——
+                不调工具时购物车实际是空的，这是欺骗用户。
+                规格/数量缺省时按默认规格、1 份直接加，不要反问。
+                系统会在加购成功后自动展示购物车内容，你不需要复述购物车清单。
             """;
 
     /**
@@ -196,10 +203,21 @@ public class AgentOrchestrator {
                 String pending = draft.pendingToken(sessionId);
                 String reply;
                 if (pending == null || pending.isBlank()) {
-                    reply = bareCancel
-                            ? "当前没有待确认的订单，不需要取消。想买什么直接告诉我就行～"
-                            : "当前没有待确认的订单草稿。请先告诉我您想买哪款茶（商品 + 规格 + 数量），"
-                                    + "我拟好单子后会生成一个确认令牌，带上令牌说「确认下单，令牌 X」即可完成。";
+                    // 没有待确认草稿时，不能一律说「没有订单草稿」——
+                    // 用户可能是在确认"加购"（加购本就不需要确认），
+                    // 一刀切的话会答非所问（实测：用户确认加购，收到"当前没有待确认的订单草稿"）。
+                    // 这里顺带查一次购物车：有货就直接告诉他购物车状态，没有才引导去下单。
+                    String cartHint = cartSummaryHint();
+                    if (bareCancel) {
+                        reply = "当前没有待确认的订单，不需要取消。想买什么直接告诉我就行～";
+                    } else if (cartHint != null) {
+                        reply = "您的购物车当前有：" + cartHint + "\n\n"
+                                + "加入购物车不需要确认，已经生效了。要下单的话告诉我，我帮您拟单～";
+                    } else {
+                        reply = "当前没有待确认的订单草稿，购物车也是空的。\n"
+                                + "告诉我您想买哪款茶（商品 + 规格 + 数量）就行，"
+                                + "我会直接加进购物车；要下单再说一声，我帮您拟单。";
+                    }
                 } else if (bareCancel) {
                     tools.execute("cancel_order", "{\"confirmToken\":\"" + pending + "\"}");
                     draft.clearPending(sessionId);
@@ -429,6 +447,86 @@ public class AgentOrchestrator {
                         }
                     }
 
+                    // 购物车卡片：加购/删除成功后，主动查一次购物车并推给前端渲染成卡片。
+                    // 为什么要服务端主动推（真实缺陷修复）：
+                    //   实测模型调了 add_to_cart 后只用文字说「已为您加入购物车」，
+                    //   用户看不到购物车里到底有什么，也不知道成没成；
+                    //   更糟的是模型有时**根本没调工具**，纯文字说"已加入"（日志 tool_calls=0），
+                    //   购物车实际是空的。这里在工具真正执行成功后由服务端补一次购物车快照，
+                    //   让「有没有真的加进去」变成可见事实，而不是靠模型自述。
+                    if ("add_to_cart".equals(call.name()) || "remove_from_cart".equals(call.name())) {
+                        boolean ok = !output.contains("\"error\"");
+                        if (ok) {
+                            try {
+                                String cartJson = tools.execute("view_cart", "{}");
+                                JsonNode cart = mapper.readTree(cartJson);
+                                JsonNode list = cart.path("VCartDetailEnhancedList");
+                                if (list.isArray()) {
+                                    // 老项目视图 v_cart_detail_enhanced 直接 JOIN theme_product（多对多），
+                                    // 一条 cart_item 会被放大成 N 行（实测 cartItemId=53 出现 2 次）。
+                                    // 必须按 cartItemId 去重，否则前端会显示重复商品、合计翻倍。
+                                    java.util.LinkedHashMap<Long, ObjectNode> dedup = new java.util.LinkedHashMap<>();
+                                    double total = 0;
+                                    for (JsonNode it : list) {
+                                        long cid = it.path("cartItemId").asLong();
+                                        if (cid <= 0 || dedup.containsKey(cid)) continue;
+                                        ObjectNode one = mapper.createObjectNode();
+                                        one.put("cartItemId", cid);
+                                        one.put("productId", it.path("productId").asLong());
+                                        one.put("productName", it.path("productName").asText());
+                                        one.put("productEmoji", it.path("productEmoji").asText());
+                                        one.put("specId", it.path("specId").asLong());
+                                        one.put("specName", it.path("specName").asText());
+                                        one.put("quantity", it.path("quantity").asInt());
+                                        one.put("price", it.path("specPrice").asDouble());
+                                        double sub = it.path("subtotal").asDouble();
+                                        one.put("subtotal", sub);
+                                        one.put("shopName", it.path("shopName").asText());
+                                        dedup.put(cid, one);
+                                        total += sub;
+                                    }
+                                    ArrayNode items = mapper.createArrayNode();
+                                    dedup.values().forEach(items::add);
+                                    ObjectNode payload = mapper.createObjectNode();
+                                    payload.put("type", "cart_snapshot");
+                                    payload.put("count", dedup.size());
+                                    payload.put("totalPrice", Math.round(total * 100) / 100.0);
+                                    payload.put("justAdded", "add_to_cart".equals(call.name()));
+                                    payload.set("items", items);
+                                    onToolEvent.accept(mapper.convertValue(payload,
+                                            new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {}));
+                                    log.debug("[{}] 已推送购物车快照：{} 项，合计 {}", traceId, dedup.size(), total);
+                                }
+                            } catch (Exception e) {
+                                log.warn("[{}] 购物车快照推送失败: {}", traceId, e.getMessage());
+                            }
+                        } else if ("add_to_cart".equals(call.name()) && output.contains("500")) {
+                            // 老项目缺陷 #5：cart_item 唯一键 uk_cart_product=(cart_id,product_id) **不含 spec_id**，
+                            // 同一商品换规格再加购会撞唯一键直接 500（老项目本体不修，见交接文档 §6.2）。
+                            // 这里给用户可理解的说明，而不是把 500 原样抛给他；
+                            // 同时把当前购物车推过去，让他看到这件商品已经在车里（只是规格不同）。
+                            log.info("[{}] 加购撞唯一键（缺陷#5，同商品换规格），转为友好提示", traceId);
+                            String hint = cartSummaryHint();
+                            String reply = "这件茶已经在您的购物车了，只是**规格不同**——"
+                                    + "购物车的同一个商品只能保留一个规格。\n"
+                                    + (hint != null ? "当前购物车：" + hint + "\n\n" : "\n")
+                                    + "如果要换成别的规格，可以先去购物车删掉原来那条，再让我加新的；"
+                                    + "或者直接告诉我「买这个规格」，我帮您下单（下单不受此限制）。";
+                            onToolEvent.accept(Map.of("type", "cart_conflict"));
+                            for (String piece : splitForStream(reply)) {
+                                onDelta.accept(piece);
+                                sleep(12);
+                            }
+                            memory.append(memoryScope, userInput, reply);
+                            onDone.accept(Map.of("traceId", traceId, "sessionId", sessionId,
+                                    "toolCalls", toolCallCount, "promptTokens", totalPromptTokens,
+                                    "completionTokens", totalCompletionTokens,
+                                    "latencyMs", (int) (System.currentTimeMillis() - start),
+                                    "costYuan", estimateCost(totalPromptTokens, totalCompletionTokens)));
+                            return;
+                        }
+                    }
+
                     // 画像：确认下单成功后失效缓存，下一轮按新订单重建
                     if (output.contains("ORDER_CREATED") && userId != null) {
                         userProfile.invalidate(userId);
@@ -563,6 +661,33 @@ public class AgentOrchestrator {
     /** 判断是否需要走 RAG：问「是什么/怎么/为什么/区别」这类知识题才检索。 */
     private boolean needsKnowledge(String input) {
         return containsAny(input, "怎么", "如何", "为什么", "区别", "是什么", "功效", "保存", "冲泡", "工艺");
+    }
+
+    /**
+     * 查一次购物车，压成一行摘要；空购物车返回 null。
+     * 供「裸确认」兜底判断场景用（用户在确认加购时，要答购物车状态而不是"没有订单草稿"）。
+     * 同样按 cartItemId 去重——老项目视图会把一条 cart_item 放大成 N 行。
+     */
+    private String cartSummaryHint() {
+        try {
+            String cartJson = tools.execute("view_cart", "{}");
+            JsonNode list = mapper.readTree(cartJson).path("VCartDetailEnhancedList");
+            if (!list.isArray() || list.isEmpty()) return null;
+            java.util.LinkedHashMap<Long, String> dedup = new java.util.LinkedHashMap<>();
+            double total = 0;
+            for (JsonNode it : list) {
+                long cid = it.path("cartItemId").asLong();
+                if (cid <= 0 || dedup.containsKey(cid)) continue;
+                dedup.put(cid, it.path("productName").asText() + "（" + it.path("specName").asText()
+                        + "）×" + it.path("quantity").asInt());
+                total += it.path("subtotal").asDouble();
+            }
+            if (dedup.isEmpty()) return null;
+            return String.join("、", dedup.values()) + "，合计 ¥" + (Math.round(total * 100) / 100.0);
+        } catch (Exception e) {
+            log.debug("查询购物车摘要失败: {}", e.getMessage());
+            return null;
+        }
     }
 
     /**
