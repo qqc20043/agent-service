@@ -43,6 +43,29 @@ public class SessionMemoryService {
 
     private static final String KEY_HISTORY = "ms:agent:mem:history:";
     private static final String KEY_SUMMARY = "ms:agent:mem:summary:";
+    /** 推荐候选（含规格）暂存：两阶段推荐需要跨轮保存——第 1 轮登记，第 2 轮用户选定后取用 */
+    private static final String KEY_REC_CANDIDATES = "ms:agent:mem:reccand:";
+
+    /** 暂存本轮推荐的候选商品（含规格），供下一轮「用户选定某款」时取用。 */
+    public void saveRecommendCandidates(String scope, String cardsJson) {
+        if (scope == null || scope.isBlank() || cardsJson == null) return;
+        try {
+            redis.opsForValue().set(KEY_REC_CANDIDATES + scope, cardsJson,
+                    Duration.ofMinutes(ttlMinutes));
+        } catch (Exception e) {
+            log.debug("暂存推荐候选失败 scope={}: {}", scope, e.getMessage());
+        }
+    }
+
+    /** 读取暂存的推荐候选（JSON 数组字符串）；无则返回 null。 */
+    public String loadRecommendCandidates(String scope) {
+        if (scope == null || scope.isBlank()) return null;
+        try {
+            return redis.opsForValue().get(KEY_REC_CANDIDATES + scope);
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     /** 读取历史消息（供组装 prompt）。 */
     public List<Message> loadHistory(String sessionId) {

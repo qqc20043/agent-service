@@ -144,13 +144,17 @@ public class AgentOrchestrator {
                 不调工具时购物车实际是空的，这是欺骗用户。
                 规格/数量缺省时按默认规格、1 份直接加，不要反问。
                 系统会在加购成功后自动展示购物车内容，你不需要复述购物车清单。
-            12. 【推荐茶叶：必须生成选购卡片】
-                ⚠️ 当你向用户**推荐**茶叶（「推荐几款绿茶」「送长辈什么茶」等）时，
-                必须先 search_tea 拿到真实商品，再调用 **recommend_tea** 把推荐商品登记成卡片
-                （productIds 取自搜索结果）。
-                调用后**只用一两句话说明推荐理由**即可——
-                **不要再逐条罗列规格和价格**（卡片上已经展示），也不要问「您要哪个规格」，
-                用户会直接在卡片上点选并选择规格。重复罗列会让用户觉得啰嗦。
+            12. 【推荐茶叶：两阶段，别一次铺开】
+                ⚠️ 推荐分两步，按用户所处的阶段回应：
+                **第 1 步（用户要推荐，如「推荐几款送长辈的茶」）**：
+                先 search_tea 拿真实商品，再调 **recommend_tea** 登记推荐（系统会记下候选），
+                然后用**简短文字**介绍这 2-3 款各自的特色与适合人群，
+                **不要逐条罗列每个规格的价格**——那是下一步的事。
+                结尾引导用户挑一款即可，例如「您想先看哪一款？」
+                **第 2 步（用户选定某款，如「就大红袍吧」）**：
+                系统会自动弹出该款的规格卡片让用户选规格与数量，你**只需一句话确认**
+                （如「好的，大红袍的规格如下，点选即可」），**不要**自行调用 prepare_order
+                替用户选规格——用户没点选规格之前，拟单会被系统拦截。
             """;
 
     /**
@@ -390,7 +394,9 @@ public class AgentOrchestrator {
             String finalAnswer = null;
             boolean authExpired = false;
             boolean blockedDraft = false;
-            boolean recommendPushed = false;              // 本轮是否已推过推荐卡片
+            boolean recommendPushed = false;              // 本轮是否已登记推荐候选
+            boolean recommendCardsPushed = false;         // 本轮是否已推过规格卡片
+            List<JsonNode> recommendCandidates = new ArrayList<>();   // 本轮推荐候选（含规格）
             List<String> lastSearchedProductIds = new ArrayList<>();  // 最近一次 search_tea 的商品 id
             for (int i = 0; i < maxIterations; i++) {
                 // 走流式分片重组而非非流式：网关非流式会丢 tool_calls（见 LlmClient#chatViaStream）
@@ -453,7 +459,9 @@ public class AgentOrchestrator {
                                 try {
                                     JsonNode cards = mapper.readTree(cardsJson).path("cards");
                                     if (cards.isArray() && !cards.isEmpty()) {
-                                        onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
+                                        onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards,
+                                                "phase", "specPick"));
+                                        recommendCardsPushed = true;   // 防 4.4 重复推
                                         log.info("[{}] 用户未指定规格，已拦截拟单并推规格卡片 productId={}",
                                                 traceId, pidForPick);
                                         // 不执行 prepare_order，改由用户点选规格后再走「选购」直通
@@ -567,19 +575,30 @@ public class AgentOrchestrator {
                         }
                     }
 
-                    // 推荐选购卡片：模型调 recommend_tea 时，把卡片推给前端渲染成可点选列表。
-                    // 用户点「选这个」→ 选规格数量 → 直接拟单，不必再让模型追问规格。
+                    // 推荐选购卡片（两阶段设计）：
+                    //  第 1 阶段（用户要推荐）→ **不推卡片**，只让模型用文字推荐几款；
+                    //  第 2 阶段（用户选定某款，如「就大红袍吧」）→ 才推**该款**的规格卡片让用户选规格。
+                    // 这样用户先看到"有哪些选择"，再做"选哪款 + 哪个规格"，认知负担更小；
+                    // 一上来就铺一堆规格卡片反而会让人无从下手。
+                    // 这里只记录候选，不推事件——推事件交给 4.4 的「选定款」分支。
                     if ("recommend_tea".equals(call.name())) {
                         try {
                             JsonNode out = mapper.readTree(output);
                             JsonNode cards = out.path("cards");
                             if (cards.isArray() && !cards.isEmpty()) {
-                                onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
-                                recommendPushed = true;
-                                log.debug("[{}] 已推送推荐卡片 {} 张", traceId, cards.size());
+                                recommendCandidates.clear();
+                                for (JsonNode c : cards) {
+                                    recommendCandidates.add(c);
+                                }
+                                recommendPushed = true;   // 标记「已登记候选」，避免 4.4 兜底重复推
+                                // 跨轮暂存：用户下一轮说「就大红袍吧」时，候选已不在本轮变量里，
+                                // 必须落 Redis 才能在下一轮匹配到商品并推规格卡片。
+                                memory.saveRecommendCandidates(memoryScope, cards.toString());
+                                log.debug("[{}] 已登记推荐候选 {} 款（暂不推卡片，等用户选定）",
+                                        traceId, cards.size());
                             }
                         } catch (Exception e) {
-                            log.warn("[{}] 推荐卡片解析失败: {}", traceId, e.getMessage());
+                            log.warn("[{}] 推荐候选解析失败: {}", traceId, e.getMessage());
                         }
                     }
 
@@ -696,85 +715,47 @@ public class AgentOrchestrator {
                 finalAnswer = "抱歉，我没能完成这个请求，请换个说法试试。";
             }
 
-            // ---------- 4.4 推荐场景兜底：模型没推卡片时补推 ----------
-            // 实测缺陷：用户说「推荐长辈喜欢的」，模型 tool_calls=0 纯文字回复，
-            // 没调 recommend_tea → 前端收不到卡片 → 用户只能靠文字里提到的茶名回一句
-            // 「就大红袍吧」，然后又因为没有规格卡片而被模型自作主张拟单。
-            // prompt 规则不可靠（模型可以无视），这里做服务端兜底。
-            if (!recommendPushed && isRecommendIntent(trimmed)) {
+            // ---------- 4.4 选定茶款 → 推该款规格卡片（两阶段设计的第 2 阶段） ----------
+            // 用户看完文字推荐后说「就大红袍吧」这类话时，才推**这一款**的规格卡片，
+            // 让用户选规格/数量，再点「选这个」直接拟单。
+            // 为什么不在第 1 阶段就推：一次铺 3 款 × 各 3 个规格 = 9 个选项，
+            // 用户还得先想"哪款"，再想"哪个规格"，认知负担反而更重。
+            if (!recommendCardsPushed) {
                 try {
-                    // 情形 A：本轮搜过商品 → 直接拿搜索结果补推卡片（不再花 LLM 调用）
-                    if (!lastSearchedProductIds.isEmpty()) {
+                    // 候选来源（按优先级）：
+                    //  ① 本轮模型调过 recommend_tea 的登记结果；
+                    //  ② 上一轮暂存在 Redis 的候选（用户看完推荐后下一轮才选定，
+                    //     此时本轮变量是空的，必须从跨轮暂存取）；
+                    //  ③ 本轮 search_tea 的结果（模型没走 recommend_tea 的退化路径）。
+                    List<JsonNode> pool = new ArrayList<>(recommendCandidates);
+                    if (pool.isEmpty()) {
+                        String cached = memory.loadRecommendCandidates(memoryScope);
+                        if (cached != null && !cached.isBlank()) {
+                            try {
+                                JsonNode arr = mapper.readTree(cached);
+                                if (arr.isArray()) for (JsonNode c : arr) pool.add(c);
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    }
+                    if (pool.isEmpty() && !lastSearchedProductIds.isEmpty()) {
                         String cardsJson = tools.execute("recommend_tea",
                                 "{\"productIds\":[" + String.join(",", lastSearchedProductIds) + "]}");
                         JsonNode cards = mapper.readTree(cardsJson).path("cards");
-                        if (cards.isArray() && !cards.isEmpty()) {
-                            onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
-                            recommendPushed = true;
-                            log.info("[{}] 推荐意图未推卡片，已用搜索结果补推 {} 张", traceId, cards.size());
-                        }
+                        if (cards.isArray()) for (JsonNode c : cards) pool.add(c);
                     }
-                    // 情形 B：本轮连搜都没搜（模型凭上下文直接作答）→ 追一轮强制它调 recommend_tea。
-                    // 此时模型刚在文字里报过茶名，带着上下文再问一次，它知道该推荐什么。
-                    if (!recommendPushed) {
-                        List<Message> nudge = new ArrayList<>(messages);
-                        nudge.add(Message.assistant(finalAnswer));
-                        nudge.add(Message.system("【系统指令】你刚才的推荐没有生成选购卡片，用户无法点选。"
-                                + "请先用 search_tea 确认商品，再调用 recommend_tea 把推荐的商品登记成卡片。"
-                                + "本轮只做这两件事，不要输出长篇文字。"));
-                        ArrayNode nudgeTools = tools.buildToolsSchema(
-                                List.of("search_tea", "recommend_tea"));
-                        for (int k = 0; k < 2 && !recommendPushed; k++) {
-                            ChatResult nr = llm.chatViaStream(nudge, nudgeTools);
-                            totalPromptTokens += nr.usage().promptTokens();
-                            totalCompletionTokens += nr.usage().completionTokens();
-                            if (!nr.hasToolCalls()) break;
-                            nudge.add(Message.assistantWithToolCalls(nr.content(),
-                                    Message.toolCallsToArray(mapper, nr.toolCalls())));
-                            for (ToolCall c : nr.toolCalls()) {
-                                String o = tools.execute(c.name(), c.arguments());
-                                if ("search_tea".equals(c.name())) {
-                                    try {
-                                        JsonNode list = mapper.readTree(o).path("ShopSpecList");
-                                        if (list.isArray()) {
-                                            lastSearchedProductIds.clear();
-                                            for (JsonNode it : list) {
-                                                long id = it.path("id").asLong(0);
-                                                if (id > 0 && lastSearchedProductIds.size() < 5) {
-                                                    lastSearchedProductIds.add(String.valueOf(id));
-                                                }
-                                            }
-                                        }
-                                    } catch (Exception ignored) {
-                                    }
-                                }
-                                if ("recommend_tea".equals(c.name())) {
-                                    try {
-                                        JsonNode cards = mapper.readTree(o).path("cards");
-                                        if (cards.isArray() && !cards.isEmpty()) {
-                                            onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
-                                            recommendPushed = true;
-                                            log.info("[{}] 追一轮后补推推荐卡片 {} 张", traceId, cards.size());
-                                        }
-                                    } catch (Exception ignored) {
-                                    }
-                                }
-                                nudge.add(Message.tool(c.id(), c.name(), truncate(o, 2000)));
-                            }
-                        }
-                        // 兜底仍失败：退化为用搜索到的商品直接推
-                        if (!recommendPushed && !lastSearchedProductIds.isEmpty()) {
-                            String cardsJson = tools.execute("recommend_tea",
-                                    "{\"productIds\":[" + String.join(",", lastSearchedProductIds) + "]}");
-                            JsonNode cards = mapper.readTree(cardsJson).path("cards");
-                            if (cards.isArray() && !cards.isEmpty()) {
-                                onToolEvent.accept(Map.of("type", "recommend_cards", "cards", cards));
-                                recommendPushed = true;
-                            }
-                        }
+                    // 在当前会话里找用户提到的那款茶（按商品名匹配用户这句话）
+                    JsonNode chosen = pickMentionedTea(trimmed, pool);
+                    if (chosen != null) {
+                        ArrayNode one = mapper.createArrayNode().add(chosen);
+                        onToolEvent.accept(Map.of("type", "recommend_cards", "cards", one,
+                                "phase", "specPick"));
+                        recommendCardsPushed = true;
+                        log.info("[{}] 用户选定「{}」，已推规格卡片",
+                                traceId, chosen.path("productName").asText());
                     }
                 } catch (Exception e) {
-                    log.debug("[{}] 推荐卡片兜底失败: {}", traceId, e.getMessage());
+                    log.debug("[{}] 规格卡片推送失败: {}", traceId, e.getMessage());
                 }
             }
 
@@ -898,6 +879,43 @@ public class AgentOrchestrator {
     /** 判断是否需要走 RAG：问「是什么/怎么/为什么/区别」这类知识题才检索。 */
     private boolean needsKnowledge(String input) {
         return containsAny(input, "怎么", "如何", "为什么", "区别", "是什么", "功效", "保存", "冲泡", "工艺");
+    }
+
+    /**
+     * 从用户这句话里，找出他选中的是哪款茶。
+     *
+     * 用在「两阶段推荐」的第 2 阶段：用户看完文字推荐后说「就大红袍吧」，
+     * 这里把「大红袍」匹配到候选商品，据此推该款的规格卡片。
+     *
+     * 匹配策略（从精确到宽松）：
+     *  ① 商品全名出现在用户话里（「大红袍」⊂「就大红袍吧」）；
+     *  ② 商品名去掉品类后缀后仍能匹配（「洞庭碧螺春」→「碧螺春」）；
+     *  ③ 唯一候选时直接选中（用户说「就它吧」，只有一款推荐的情况下意图明确）。
+     * 匹配不到返回 null（不硬猜，避免推错款）。
+     */
+    private JsonNode pickMentionedTea(String userInput, List<JsonNode> pool) {
+        if (userInput == null || pool == null || pool.isEmpty()) return null;
+        String q = userInput.trim();
+        // ① 全名匹配
+        for (JsonNode c : pool) {
+            String name = c.path("productName").asText("");
+            if (!name.isEmpty() && q.contains(name)) return c;
+        }
+        // ② 去掉常见地域/前缀后缀后再匹配（「洞庭碧螺春」→「碧螺春」，「武夷山大红袍」→「大红袍」）
+        for (JsonNode c : pool) {
+            String name = c.path("productName").asText("");
+            if (name.length() < 3) continue;
+            // 取名字的后 2-4 字作为核心词（中文茶名核心通常在尾部）
+            for (int len = Math.min(4, name.length()); len >= 2; len--) {
+                String core = name.substring(name.length() - len);
+                if (core.length() >= 2 && q.contains(core)) return c;
+            }
+        }
+        // ③ 唯一候选 + 用户表达了"就这个"的意向
+        if (pool.size() == 1 && containsAny(q, "就这个", "就它", "这个吧", "它吧", "要这个", "买这个")) {
+            return pool.get(0);
+        }
+        return null;
     }
 
     /**
