@@ -54,6 +54,9 @@ public class ToolRegistry {
                 + "每条商品的 specs 字段列出它**全部可用规格**（specId/specName/price/stock）；"
                 + "顶层 spec/price 只是默认规格的展示副本。判断某规格是否存在必须以 specs 为准——"
                 + "默认规格是别的装量，不代表其他规格不存在，禁止据此回绝用户。"
+                + "⚠️ 关键词没有精确匹配时，本工具会自动按相近词召回**同类商品**，"
+                + "并在 fuzzyNote 里说明。此时必须如实告知用户「没有叫 X 的商品，但有相近的」"
+                + "并列出候选让用户选，**禁止谎称找到、禁止直接替用户下单**。"
                 + "命中数较多时可能未附 specs，此时用 get_tea_detail 查看该商品的全部规格。",
                 params(Map.of("keyword", "string"), List.of("keyword")), false,
                 args -> searchTea(args.path("keyword").asText()));
@@ -115,6 +118,18 @@ public class ToolRegistry {
         register("list_coupons", "查询当前用户已领取的优惠券",
                 emptyParams(), false,
                 args -> tearSpring.couponUserList());
+
+        // 下单前让用户确认收货地址：返回完整地址列表供前端渲染成可选卡片。
+        // 为什么单独做一个工具而不是复用 list_addresses：
+        //  list_addresses 只把 JSON 丢给 LLM，用户看不到结构化列表；
+        //  本工具的结果会被编排器识别并推 confirm_address 事件，前端渲染成
+        //  「选择收货地址」卡片（单选项 + 常用/公司标签 + 姓名电话 + 新增按钮）。
+        register("request_address_pick", "下单前请用户确认收货地址（写操作前置步骤，本身无副作用）。"
+                        + "在准备拟单时若用户没有明确指定用哪个地址，调用它让用户从列表中选择；"
+                        + "用户从卡片选好后会以「用地址 <id>」的形式回复。"
+                        + "若用户已在对话里直接报了新地址，改用 add_address 代填，不必调用本工具。",
+                emptyParams(), false,
+                args -> tearSpring.addressList());
 
         register("user_profile", "查询当前登录用户的个人信息",
                 emptyParams(), false,
@@ -299,10 +314,27 @@ public class ToolRegistry {
             String kw = keyword == null ? "" : keyword.trim().toLowerCase();
             ArrayNode filtered = mapper.createArrayNode();
             int scanned = list.size();
-            for (JsonNode item : list) {
-                if (filtered.size() >= SEARCH_MAX_RESULTS) break;
-                if (kw.isEmpty() || item.toString().toLowerCase().contains(kw)) {
+            String matchedBy = "";
+            if (kw.isEmpty()) {
+                for (JsonNode item : list) {
+                    if (filtered.size() >= SEARCH_MAX_RESULTS) break;
                     filtered.add(item);
+                }
+            } else {
+                // 分级降级匹配：整串 → 去掉修饰词 → 核心品类词
+                // 为什么需要（真实缺陷）：用户说「雨前龙井」，而库里只有「明前龙井」，
+                // 整串子串匹配直接 0 命中，模型只能说「没找到这个商品」并让用户重搜——
+                // 但正确的做法是把**同品类的真实商品**摆出来让用户选（明前/雨前是同类茶的采制时节差异）。
+                // 逐级放宽召回：先精确，再退到品类，绝不跨品类乱猜。
+                for (String variant : keywordVariants(kw)) {
+                    for (JsonNode item : list) {
+                        if (filtered.size() >= SEARCH_MAX_RESULTS) break;
+                        if (item.toString().toLowerCase().contains(variant)) filtered.add(item);
+                    }
+                    if (filtered.size() > 0) {
+                        matchedBy = variant.equals(kw) ? "整串精确" : ("降级词「" + variant + "」");
+                        break;   // 一旦命中就不再放宽，保证精确优先
+                    }
                 }
             }
 
@@ -324,6 +356,17 @@ public class ToolRegistry {
             out.put("code", 200);
             out.put("matched", filtered.size());
             out.put("totalScanned", scanned);
+            if (!kw.isEmpty()) out.put("matchedBy", matchedBy);
+            // 降级命中时明确提示：用户原词没有精确匹配，这是同品类的近似结果，
+            // 模型必须如实说明「没有完全一致的，但有相近的」并把选择权交给用户，
+            // 禁止谎称"找到了"或擅自替用户决定。
+            if (!kw.isEmpty() && !"整串精确".equals(matchedBy) && filtered.size() > 0) {
+                out.put("fuzzyNote", "用户原关键词「" + keyword + "」在商品库里**没有精确匹配**，"
+                        + "以上是按相近词「" + matchedBy + "」召回的**同类商品**。"
+                        + "回复时必须如实说明：没有叫「" + keyword + "」的商品，"
+                        + "但有下列相近的（列出名称/规格/价格），请用户确认要哪一个再拟单。"
+                        + "⚠️ 禁止把它们说成就是用户要的那款，也禁止不说明差异就直接下单。");
+            }
             if (enriched) {
                 out.put("specsNote", "本次已在每条商品的 specs 字段附带该商品**全部可用规格**"
                         + "（specId/specName/price/stock/isDefault）。"
@@ -331,16 +374,66 @@ public class ToolRegistry {
                         + "判断「有没有某个规格」必须以 specs 为准，禁止因为默认规格不同就断定规格不存在。");
             }
             if (filtered.isEmpty()) {
-                out.put("hint", "没有匹配的商品，建议换一个关键词或调用 list_categories 看分类");
+                out.put("hint", "没有匹配的商品。可尝试：①换更宽泛的品类词（如「龙井」而不是「雨前龙井」）；"
+                        + "②调用 list_categories 看有哪些品类。不要凭空推荐不存在的商品。");
             }
             out.set("ShopSpecList", filtered);
-            log.debug("search_tea 关键词[{}]：扫描 {} 条，命中 {} 条，规格补全={}",
-                    keyword, scanned, filtered.size(), enriched);
+            log.debug("search_tea 关键词[{}]：扫描 {} 条，命中 {} 条，规格补全={}，匹配方式={}",
+                    keyword, scanned, filtered.size(), enriched, matchedBy.isEmpty() ? "-" : matchedBy);
             return mapper.writeValueAsString(out);
         } catch (Exception e) {
             log.warn("search_tea 过滤失败，退回原始结果: {}", e.getMessage());
             return raw;
         }
+    }
+
+    /**
+     * 生成关键词的降级候选（从精确到宽松，顺序即优先级）。
+     *
+     * 背景（真实缺陷）：用户说「雨前龙井」→ 库里只有「明前龙井」→ 整串匹配 0 命中，
+     * 模型只能回「没找到这个商品」并让用户重搜，体验断裂。
+     * 明前/雨前是**同一款茶的不同采制时节**，应当能召回彼此；
+     * 但降级必须克制：只去掉「时节/等级/包装」这类修饰词，退到**品类词**为止，
+     * 绝不跨品类联想（「龙井」不能退化成「绿茶」把所有绿茶都倒出来，那会淹没有效信息）。
+     *
+     * 策略（按顺序尝试，首个命中即止）：
+     *  ① 原词整串
+     *  ② 去掉前缀修饰（雨前/明前/特级/一级/新茶/陈茶/正品/野生/高山/礼盒…）
+     *  ③ 去掉后缀修饰（礼盒装/特级/散装…）
+     *  ④ 核心品类词（去掉所有修饰后的剩余部分，长度 ≥2 才用）
+     */
+    private List<String> keywordVariants(String kw) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        out.add(kw);
+
+        // 修饰词表：只收敛到「不影响品类判断」的限定词
+        String[] affixes = {
+                "雨前", "明前", "清明前", "谷雨前",
+                "特级", "一级", "二级", "三级", "优级", "头采", "明后",
+                "新茶", "陈茶", "春茶", "秋茶", "当季",
+                "正品", "野生", "高山", "古树", "原产", "正宗", "精选",
+                "礼盒装", "礼盒", "散装", "罐装", "袋装", "小罐", "盒装"
+        };
+
+        // ② 去前缀
+        for (String a : affixes) {
+            if (kw.startsWith(a) && kw.length() > a.length() + 1) {
+                out.add(kw.substring(a.length()));
+            }
+        }
+        // ③ 去后缀
+        for (String a : affixes) {
+            if (kw.endsWith(a) && kw.length() > a.length() + 1) {
+                out.add(kw.substring(0, kw.length() - a.length()));
+            }
+        }
+        // ④ 全去修饰后的核心词（仅当剩余长度 ≥2，避免单字乱匹配）
+        String core = kw;
+        for (String a : affixes) core = core.replace(a, "");
+        if (core.length() >= 2 && !core.equals(kw)) out.add(core);
+
+        // 过滤空串与单字（单字匹配噪音太大）
+        return out.stream().filter(s -> s != null && s.length() >= 2).toList();
     }
 
     /**

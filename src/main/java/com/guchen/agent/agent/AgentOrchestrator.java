@@ -3,6 +3,7 @@ package com.guchen.agent.agent;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.guchen.agent.client.FeignAuthConfig;
 import com.guchen.agent.llm.LlmClient;
 import com.guchen.agent.llm.LlmClient.ChatResult;
@@ -77,6 +78,13 @@ public class AgentOrchestrator {
     private static final java.util.regex.Pattern BARE_CANCEL_PATTERN =
             java.util.regex.Pattern.compile("^\s*(取消|不要了|算了|不买了|撤销)\s*[吧呢啊。！!，,~～]*\s*$");
 
+    /**
+     * 地址选择协议：前端地址卡片点选后发出「用地址 26」/「用地址26」。
+     * 解析出 addressId 后写成显式指令交给 LLM（而不是让 LLM 自己从历史里猜 id）。
+     */
+    private static final java.util.regex.Pattern PICK_ADDRESS_PATTERN =
+            java.util.regex.Pattern.compile("^\\s*用地址\\s*[:：]?\\s*(\\d{1,12})\\s*$");
+
     private static final String SYSTEM_PROMPT = """
             你是「漫思茶」电商平台的智能茶饮顾问，负责帮用户找茶、问茶、下单。
 
@@ -92,6 +100,13 @@ public class AgentOrchestrator {
                用户回复「确认」并附令牌时，只调用 confirm_order(该令牌)，绝不重新拟单或执行其他工具。
             7. 用户在对话里直接报收货人/电话/地址时（如「收货人 qq，电话 182...，地址南昌大学」），
                调用 add_address 替用户代填，然后把新地址用于拟单，不要让用户去 App 里手动添加。
+            7.5 【下单前必须确认收货地址】准备拟单时，先确认用哪个地址：
+               - 用户在**本轮对话里刚报过**新地址 → 用 add_address 建好后直接拟单；
+               - 否则（要沿用已有地址）→ **必须先调用 request_address_pick**，
+                 前端会把地址列表渲染成卡片让用户点选；用户点选后回复形如「用地址 26」，
+                 你收到后把该 id 作为 addressId 传给 prepare_order。
+               不要凭历史记忆猜 addressId，也不要在用户没确认地址前就拟单。
+               被问到「对不对/要修改吗」时如实复述该地址的收货人、电话与完整地址。
             8. 【规格判断】判断某商品「有没有某个规格」时，**必须以接口返回的规格清单为准**：
                search_tea 返回的 specs 字段、或 get_tea_detail 返回的 productSpecs。
                ⚠️ search_tea 顶层那个 `spec`/`price` 只是**默认规格的展示副本**——
@@ -206,7 +221,29 @@ public class AgentOrchestrator {
             }
 
             // ---------- 1. 意图路由（确定性） ----------
+            // 地址卡片点选：「用地址 28」→ 改写成显式拟单指令。
+            // 不能原样丢给 LLM：实测模型会把「用地址 28」当成一次地址查询，
+            // 只调 list_addresses 就收尾，不再继续拟单（拟单链路断在这里）。
+            // 这里把它翻译成「用 addressId=28 拟单」的硬指令，模型只需照做。
+            String effectiveInput = userInput;
+            java.util.regex.Matcher pa = PICK_ADDRESS_PATTERN.matcher(trimmed);
+            String selectedAddressId = null;
+            if (pa.matches()) {
+                String aid = pa.group(1);
+                selectedAddressId = aid;
+                effectiveInput = "【系统指令】用户已从地址卡片选定收货地址，addressId=" + aid + "。"
+                        + "请直接用该 addressId 调用 prepare_order 完成拟单（productId/specId/quantity "
+                        + "沿用上一轮已确认的商品与规格），然后复述拟单内容等待用户确认。"
+                        + "不要重新查询地址，也不要把「用地址」当成新的购物需求。";
+                log.info("[{}] 地址卡片选定 addressId={}，改写为拟单指令", traceId, aid);
+            }
+
             List<String> candidateTools = routeIntent(userInput);
+            if (pa.matches()) {
+                // 点选地址后必然要拟单，路由必须放行 prepare_order，否则模型无工具可用
+                candidateTools = List.of("prepare_order", "confirm_order", "cancel_order",
+                        "search_tea", "get_tea_detail", "list_addresses");
+            }
             ArrayNode toolsSchema = tools.buildToolsSchema(candidateTools);
             log.debug("[{}] 意图路由命中工具: {}", traceId, candidateTools);
 
@@ -230,7 +267,7 @@ public class AgentOrchestrator {
 
             // 多轮记忆（登录用户跨会话共享）
             messages.addAll(memory.loadHistory(memoryScope));
-            messages.add(Message.user(userInput));
+            messages.add(Message.user(effectiveInput));
 
             // ---------- 3. ReAct 循环（受控自主） ----------
             String finalAnswer = null;
@@ -271,7 +308,46 @@ public class AgentOrchestrator {
                             "args", call.arguments()));
 
                     long t0 = System.currentTimeMillis();
-                    String output = tools.execute(call.name(), call.arguments());
+
+                    // ===== 地址确认的确定性保障（服务端强制，不依赖模型自觉） =====
+                    // 需求：下单前必须先让用户确认收货地址（点了才知道对不对）。
+                    // 实测模型并不可靠——有时调 request_address_pick，有时直接 prepare_order 跳过地址确认。
+                    // 因此这里在拟单前做一次硬校验：本会话还没选定地址、且用户也没在本轮报新地址时，
+                    // 拦截 prepare_order，改为主动推地址卡片，让用户先点选。
+                    boolean addressGate = false;
+                    if ("prepare_order".equals(call.name())) {
+                        boolean pickedThisTurn = pa.matches() || selectedAddressId != null;
+                        boolean gaveNewAddress = containsAny(trimmed, "收货人", "电话", "地址", "小区", "路", "号", "栋");
+                        if (!pickedThisTurn && !gaveNewAddress) {
+                            try {
+                                String addrJson = tools.execute("request_address_pick", "{}");
+                                JsonNode arr = mapper.readTree(addrJson).path("addressList");
+                                if (arr.isArray() && !arr.isEmpty()) {
+                                    ArrayNode slim = mapper.createArrayNode();
+                                    for (JsonNode a : arr) {
+                                        ObjectNode one = mapper.createObjectNode();
+                                        one.put("addressId", a.path("id").asLong());
+                                        one.put("name", a.path("name").asText());
+                                        one.put("phone", a.path("phone").asText());
+                                        one.put("tag", a.path("tag").asText());
+                                        one.put("fullAddress", a.path("fullAddress").asText());
+                                        one.put("isDefault", a.path("isDefault").asInt());
+                                        slim.add(one);
+                                    }
+                                    onToolEvent.accept(Map.of("type", "confirm_address", "addresses", slim));
+                                    addressGate = true;
+                                    log.info("[{}] 拟单前未确认地址，已拦截并推地址卡片", traceId);
+                                }
+                            } catch (Exception e) {
+                                log.warn("[{}] 地址卡片推送失败，放行拟单: {}", traceId, e.getMessage());
+                            }
+                        }
+                    }
+
+                    String output = addressGate
+                            ? "{\"error\":\"请先确认收货地址：已向前端推送地址卡片，等用户选定后"
+                              + "会以「用地址 <id>」回复，届时再带 addressId 调用 prepare_order。\"}"
+                            : tools.execute(call.name(), call.arguments());
                     int latency = (int) (System.currentTimeMillis() - t0);
 
                     // 幂等与可观测：写操作单独落表
@@ -313,6 +389,32 @@ public class AgentOrchestrator {
                         } catch (Exception e) {
                             // 不能静默吞：解析失败意味着前端收不到确认按钮，用户会卡住
                             log.warn("[{}] prepare_order 结果解析失败: {} output={}", traceId, e.getMessage(), output);
+                        }
+                    }
+
+                    // 地址确认：模型调 request_address_pick 时，把地址列表推给前端渲染成可选卡片
+                    // （高德/千问风格：单选项 + 常用/公司标签 + 姓名电话 + 底部「新增收货地址」）。
+                    // 这样用户在**点选**而不是打字，既降低出错也符合移动端习惯。
+                    if ("request_address_pick".equals(call.name())) {
+                        try {
+                            JsonNode out = mapper.readTree(output);
+                            JsonNode arr = out.path("addressList");
+                            if (arr.isArray() && !arr.isEmpty()) {
+                                ArrayNode slim = mapper.createArrayNode();
+                                for (JsonNode a : arr) {
+                                    ObjectNode one = mapper.createObjectNode();
+                                    one.put("addressId", a.path("id").asLong());
+                                    one.put("name", a.path("name").asText());
+                                    one.put("phone", a.path("phone").asText());
+                                    one.put("tag", a.path("tag").asText());
+                                    one.put("fullAddress", a.path("fullAddress").asText());
+                                    one.put("isDefault", a.path("isDefault").asInt());
+                                    slim.add(one);
+                                }
+                                onToolEvent.accept(Map.of("type", "confirm_address", "addresses", slim));
+                            }
+                        } catch (Exception e) {
+                            log.warn("[{}] 地址列表解析失败: {} output={}", traceId, e.getMessage(), output);
                         }
                     }
 
@@ -406,12 +508,14 @@ public class AgentOrchestrator {
         if (containsAny(q, "购物车", "加购", "cart"))
             return List.of("view_cart", "add_to_cart", "remove_from_cart", "search_tea", "get_tea_detail");
         if (containsAny(q, "下单", "购买", "结算", "order"))
-            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address", "view_cart",
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address",
+                    "request_address_pick", "view_cart",
                     "prepare_order", "confirm_order", "cancel_order");
         // 单字「买」放最后：它太宽泛（「买2份」/「想买」都会命中），
         // 只在没有更具体意图时才走下单流程。
         if (containsAny(q, "买"))
-            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address", "view_cart",
+            return List.of("search_tea", "get_tea_detail", "list_addresses", "add_address",
+                    "request_address_pick", "view_cart",
                     "prepare_order", "confirm_order", "cancel_order");
         if (containsAny(q, "订单", "history", "买的"))
             return List.of("list_orders");
